@@ -1,4 +1,4 @@
-import type { Hooks, Plugin, PluginInput, PluginOptions } from "@opencode-ai/plugin";
+import type { Hooks, Plugin, PluginInput, PluginModule, PluginOptions } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import type { Session } from "@opencode-ai/sdk";
 import { type SweeperOptions, parseOptions } from "./options.js";
@@ -109,7 +109,7 @@ function makeSweepTool(
   });
 }
 
-const plugin: Plugin = async (input: PluginInput, options?: PluginOptions) => {
+const server: Plugin = async (input: PluginInput, options?: PluginOptions) => {
   const opts = parseOptions(options);
   const protectedSessions = new Set<string>(opts.protect);
   const client = buildSweeperClient(input);
@@ -174,4 +174,13 @@ const plugin: Plugin = async (input: PluginInput, options?: PluginOptions) => {
   return hooks;
 };
 
-export default plugin;
+// Default export MUST be the `PluginModule` shape `{ id, server }` rather than a bare
+// `Plugin` function. opencode's `applyPlugin` → `readV1Plugin(mode="detect")` only
+// routes through the v1 path that propagates `Hooks.tool` into `ToolRegistry` (and
+// thus into the LLM agent functions list) when `mod.default` is a record containing
+// `server`/`tui`/`id` (sst/opencode src/plugin/shared.ts readV1Plugin, SHA 68f225a).
+// A bare async function falls into `getLegacyPlugins`, which in opencode@1.17.13 does
+// not surface plugin tools to the LLM tool registry even though the `config` hook still
+// fires — that was the v0.1.1 regression where `/sweep` appeared in the TUI palette
+// but the LLM could not actually invoke the `sweep` tool.
+export default { id: "opencode-sweeper", server } satisfies PluginModule;

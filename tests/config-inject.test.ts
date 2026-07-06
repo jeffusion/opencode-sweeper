@@ -1,7 +1,13 @@
 import { beforeEach, describe, expect, mock, test } from "bun:test";
 import type { Hooks, PluginInput } from "@opencode-ai/plugin";
 import type { Config, Session } from "@opencode-ai/sdk";
-import plugin from "../src/index";
+import pluginModule from "../src/index";
+
+// pluginModule is now a `PluginModule` shape `{ id, server }` (see src/index.ts
+// header comment for the rationale — required so opencode's v1 plugin loader
+// surfaces `Hooks.tool` to the LLM tool registry). Tests exercise `server`
+// directly to keep the same assertions on the returned `Hooks`.
+const plugin = pluginModule.server;
 
 type CommandMap = NonNullable<Config["command"]>;
 type CommandEntry = CommandMap[string];
