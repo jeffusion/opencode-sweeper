@@ -149,4 +149,54 @@ describe("runSweep mixed coverage", () => {
       expect(client.deleteCalls).toEqual(["child"]);
     });
   });
+
+  it("preserves expired ancestors of protected subagents", async () => {
+    await withMockedNow(FIXED_NOW, async () => {
+      const client = new MockSweeperClient([
+        makeSession({
+          id: "expired-parent",
+          ageMs: 40 * 24 * 60 * 60 * 1_000,
+          title: "expired parent",
+          directory: "/main",
+        }),
+        makeSession({
+          id: "protected-child",
+          ageMs: 40 * 24 * 60 * 60 * 1_000,
+          title: "protected child",
+          directory: "/main",
+          parentID: "expired-parent",
+        }),
+        makeSession({
+          id: "stale-sibling",
+          ageMs: 40 * 24 * 60 * 60 * 1_000,
+          title: "stale sibling",
+          directory: "/main",
+          parentID: "expired-parent",
+        }),
+      ]);
+
+      const result = await runSweep(
+        client,
+        defaultSweeperOpts({
+          expiryMs: 30 * 24 * 60 * 60 * 1_000,
+          subagentExpiryMs: 7 * 24 * 60 * 60 * 1_000,
+          recentActivityGraceMs: 60 * 60 * 1_000,
+          dryRun: false,
+        }),
+        new Set(["protected-child"]),
+      );
+
+      expect(result.protectedCount).toBe(2);
+      expect(result.deleted).toBe(1);
+      expect(result.deletions).toEqual([
+        {
+          id: "stale-sibling",
+          title: "stale sibling",
+          parentID: "expired-parent",
+          dryRun: false,
+        },
+      ]);
+      expect(client.deleteCalls).toEqual(["stale-sibling"]);
+    });
+  });
 });

@@ -53,6 +53,44 @@ function errorMessage(error: unknown): string {
   return String(error);
 }
 
+function protectedCascadeIDs(
+  sessions: SessionLike[],
+  protectedSessionIDs: ReadonlySet<string>,
+): Set<string> {
+  const parentByID = new Map<string, string>();
+
+  for (const session of sessions) {
+    if (session.parentID !== undefined) {
+      parentByID.set(session.id, session.parentID);
+    }
+  }
+
+  const protectedIDs = new Set(protectedSessionIDs);
+
+  for (const session of sessions) {
+    if (!protectedSessionIDs.has(session.id)) {
+      continue;
+    }
+
+    let currentID = session.id;
+    const seen = new Set<string>();
+
+    while (!seen.has(currentID)) {
+      seen.add(currentID);
+      protectedIDs.add(currentID);
+
+      const parentID = parentByID.get(currentID);
+      if (parentID === undefined) {
+        break;
+      }
+
+      currentID = parentID;
+    }
+  }
+
+  return protectedIDs;
+}
+
 export async function runSweep(
   client: SweeperClient,
   opts: {
@@ -65,6 +103,7 @@ export async function runSweep(
 ): Promise<SweepResult> {
   const now = Date.now();
   const sessions = await client.session.list();
+  const cascadeProtectedIDs = protectedCascadeIDs(sessions, protectedSessionIDs);
 
   const result: SweepResult = {
     scanned: 0,
@@ -81,7 +120,7 @@ export async function runSweep(
   for (const session of sessions) {
     result.scanned += 1;
 
-    if (protectedSessionIDs.has(session.id)) {
+    if (cascadeProtectedIDs.has(session.id)) {
       result.protectedCount += 1;
       continue;
     }
