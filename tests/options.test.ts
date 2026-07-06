@@ -5,7 +5,7 @@ import { parseOptions } from "../src/options";
 describe("parseOptions", () => {
   it("returns defaults for undefined", () => {
     expect(parseOptions(undefined)).toEqual({
-      expiryMs: 604_800_000,
+      expiryMs: 2_592_000_000,
       subagentExpiryMs: 604_800_000,
       intervalMs: 3_600_000,
       dryRun: false,
@@ -16,7 +16,7 @@ describe("parseOptions", () => {
 
   it("returns defaults for an empty object", () => {
     expect(parseOptions({})).toEqual({
-      expiryMs: 604_800_000,
+      expiryMs: 2_592_000_000,
       subagentExpiryMs: 604_800_000,
       intervalMs: 3_600_000,
       dryRun: false,
@@ -71,7 +71,7 @@ describe("parseOptions", () => {
 
   it("parses recentActivityGrace as a duration string", () => {
     expect(parseOptions({ recentActivityGrace: "1d" })).toEqual({
-      expiryMs: 604_800_000,
+      expiryMs: 2_592_000_000,
       subagentExpiryMs: 604_800_000,
       intervalMs: 3_600_000,
       dryRun: false,
@@ -82,7 +82,7 @@ describe("parseOptions", () => {
 
   it("parses dryRun strictly as boolean", () => {
     expect(parseOptions({ dryRun: true })).toEqual({
-      expiryMs: 604_800_000,
+      expiryMs: 2_592_000_000,
       subagentExpiryMs: 604_800_000,
       intervalMs: 3_600_000,
       dryRun: true,

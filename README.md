@@ -15,7 +15,7 @@ Add `opencode-sweeper` to the `plugin` array in your `opencode.json`:
     [
       "opencode-sweeper",
       {
-        "expiry": "7d",
+        "expiry": "30d",
         "interval": "1h",
         "dryRun": false,
         "protect": [],
@@ -33,7 +33,7 @@ For local development, install via `file://`:
   "plugin": [
     [
       "file:///absolute/path/to/opencode-sweeper",
-      { "expiry": "7d", "interval": "1h" }
+      { "expiry": "30d", "interval": "1h" }
     ]
   ]
 }
@@ -45,9 +45,9 @@ For local development, install via `file://`:
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `expiry` | `string \| number` | `"7d"` | String duration (`"1d"`, `"12h"`, `"30m"`, `"60s"`, `"100ms"`) or raw milliseconds number. **Applies to main sessions** (sessions with no `parentID`). Sessions whose `time.updated` is older than this are deletion candidates. |
+| `expiry` | `string \| number` | `"30d"` | String duration (`"1d"`, `"12h"`, `"30m"`, `"60s"`, `"100ms"`) or raw milliseconds number. **Applies to main sessions** (sessions with no `parentID`). Sessions whose `time.updated` is older than this are deletion candidates. |
 | `expiryMs` | `number` | — | Override-raw-milliseconds form of `expiry`. Mutually exclusive with `expiry`. |
-| `subagentExpiry` | `string \| number` | `"7d"` (independent of `expiry`) | String duration or raw ms. **Applies only to subagent sessions** (sessions with a `parentID`). Has its own fixed 7d default — it does **not** inherit from `expiry`. So `expiry: "30d"` alone leaves `subagentExpiry` at 7d, letting subagents be cleaned faster than main sessions. Set this explicitly when you want a different subagent threshold. | |
+| `subagentExpiry` | `string \| number` | `"7d"` (independent of `expiry`) | String duration or raw ms. **Applies only to subagent sessions** (sessions with a `parentID`). Has its own fixed 7d default — it does **not** inherit from `expiry`. With the default `expiry: "30d"`, subagents are still cleaned at 7d unless you set this explicitly to a different value. Set this explicitly when you want a different subagent threshold. | |
 | `subagentExpiryMs` | `number` | — | Override-raw-milliseconds form of `subagentExpiry`. Mutually exclusive with `subagentExpiry`. |
 | `interval` | `string \| number` | `"1h"` | Background sweep cadence. Minimum accepted value is `60000` ms (1 minute) — shorter intervals are rejected. `0` disables the timer entirely. |
 | `intervalMs` | `number` | — | Override-raw-milliseconds form of `interval`. Mutually exclusive with `interval`. |

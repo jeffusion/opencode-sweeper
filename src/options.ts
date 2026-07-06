@@ -22,8 +22,8 @@ type OptionSource = Record<string, unknown> & {
   readonly subagentExpiryMs?: unknown;
 };
 
-const DEFAULT_EXPIRY_MS = 604_800_000;
-const DEFAULT_SUBAGENT_EXPIRY_MS = 604_800_000;
+const DEFAULT_EXPIRY_MS = 2_592_000_000; // 30d
+const DEFAULT_SUBAGENT_EXPIRY_MS = 604_800_000; // 7d
 const DEFAULT_INTERVAL_MS = 3_600_000;
 const DEFAULT_RECENT_ACTIVITY_GRACE_MS = 3_600_000;
 const MIN_INTERVAL_MS = 60_000;
