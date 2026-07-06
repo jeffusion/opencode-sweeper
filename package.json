@@ -1,0 +1,51 @@
+{
+  "name": "opencode-sweeper",
+  "version": "0.1.0",
+  "type": "module",
+  "license": "MIT",
+  "description": "opencode plugin that sweeps expired sessions and subagents on a configurable schedule, with a /sweep slash command for manual cleanup.",
+  "author": "jeffusion <admin@jeffusion.cc>",
+  "homepage": "https://github.com/jeffusion/opencode-sweeper",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jeffusion/opencode-sweeper.git"
+  },
+  "bugs": {
+    "url": "https://github.com/jeffusion/opencode-sweeper/issues"
+  },
+  "keywords": ["opencode", "opencode-plugin", "session", "cleanup", "sweep", "subagent"],
+  "main": "./dist/index.js",
+  "exports": {
+    "./server": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": ["dist"],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "bun build src/index.ts --outdir dist --target bun && bunx tsc --emitDeclarationOnly --declaration --outDir dist",
+    "test": "bun test",
+    "typecheck": "bunx tsc --noEmit",
+    "lint": "bunx biome check ."
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^1.9.4",
+    "@semantic-release/changelog": "^6.0.3",
+    "@semantic-release/commit-analyzer": "^13.0.1",
+    "@semantic-release/git": "^10.0.1",
+    "@semantic-release/github": "^11.0.0",
+    "@semantic-release/npm": "^12.0.0",
+    "@semantic-release/release-notes-generator": "^14.0.3",
+    "bun-types": "^1.3.0",
+    "semantic-release": "^24.2.0",
+    "typescript": "^5.6.0"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.17.0",
+    "@opencode-ai/sdk": "^1.17.0",
+    "zod": "^3.23.0"
+  }
+}

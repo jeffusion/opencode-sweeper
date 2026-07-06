@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.omo/
+.codegraph
+.cortexkit/
+.DS_Store
+*.log
