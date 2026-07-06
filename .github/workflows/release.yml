@@ -47,7 +47,6 @@ jobs:
         with:
           node-version: "24"
           registry-url: https://registry.npmjs.org
-          package-manager-cache: false
 
       - name: Ensure npm supports Trusted Publishing (>= 11.5.1)
         run: npm install -g npm@^11.5.2
