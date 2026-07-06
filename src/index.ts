@@ -1,6 +1,6 @@
 import type { Hooks, Plugin, PluginInput, PluginModule, PluginOptions } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
-import type { Session } from "@opencode-ai/sdk";
+import { type SessionRow, listSessions, resolveOpencodeDbPath, rowToSessionLike } from "./db.js";
 import { type SweeperOptions, parseOptions } from "./options.js";
 import { type SessionLike, type SweepResult, type SweeperClient, runSweep } from "./sweep.js";
 
@@ -10,16 +10,6 @@ const COMMAND_NAME = "sweep";
 const COMMAND_TEMPLATE =
   "Run the `sweep` tool now and report its result back to the user verbatim. Do not summarize or omit counts.";
 const COMMAND_DESCRIPTION = "Sweep expired sessions and subagents now (runs the sweep tool).";
-
-function adaptSession(s: Session): SessionLike {
-  return {
-    id: s.id,
-    title: s.title,
-    directory: s.directory,
-    parentID: s.parentID,
-    time: { created: s.time.created, updated: s.time.updated },
-  };
-}
 
 function formatSweepSummary(r: SweepResult): string {
   const lines = [
@@ -57,16 +47,22 @@ function isNotFoundError(error: unknown): boolean {
   return (error as { name?: unknown }).name === "NotFoundError";
 }
 
-function buildSweeperClient(input: PluginInput): SweeperClient {
+/**
+ * Build a `SweeperClient` that reads all sessions from the opencode SQLite DB
+ * directly (bypassing the SDK's project-scoped, limit-100 `session.list()`)
+ * and deletes through the SDK's `session.delete()` so opencode's reverse-FK
+ * cascade (`Session.remove` → `children()` recursion + 404 silent in our
+ * adapter) still applies. Mixed read/write paths avoid both the SDK scan
+ * blind spot and a direct-sqlite DELETE that would bypass opencode app-layer
+ * invariants (e.g. children link cleanup).
+ */
+function buildSweeperClient(input: PluginInput, opts: SweeperOptions): SweeperClient {
+  const dbPath = resolveOpencodeDbPath(opts.dbPath);
   return {
     session: {
       async list(): Promise<SessionLike[]> {
-        const res = await input.client.session.list();
-        if (res.error !== undefined) {
-          throw new Error(`session.list failed: ${String(res.error)}`);
-        }
-        const sessions = res.data ?? [];
-        return sessions.map(adaptSession);
+        const rows: SessionRow[] = await listSessions(dbPath);
+        return rows.map(rowToSessionLike);
       },
       async delete(args: { path: { id: string } }): Promise<boolean> {
         const res = await input.client.session.delete({ path: { id: args.path.id } });
@@ -112,7 +108,7 @@ function makeSweepTool(
 const server: Plugin = async (input: PluginInput, options?: PluginOptions) => {
   const opts = parseOptions(options);
   const protectedSessions = new Set<string>(opts.protect);
-  const client = buildSweeperClient(input);
+  const client = buildSweeperClient(input, opts);
 
   let timer: ReturnType<typeof setInterval> | undefined;
   if (opts.intervalMs > 0) {
@@ -157,7 +153,7 @@ const server: Plugin = async (input: PluginInput, options?: PluginOptions) => {
       };
       await logInfo(
         input,
-        `loaded: expiryMs=${opts.expiryMs} subagentExpiryMs=${opts.subagentExpiryMs} intervalMs=${opts.intervalMs} dryRun=${opts.dryRun} protect=${opts.protect.length} recentActivityGraceMs=${opts.recentActivityGraceMs}`,
+        `loaded: expiryMs=${opts.expiryMs} subagentExpiryMs=${opts.subagentExpiryMs} intervalMs=${opts.intervalMs} dryRun=${opts.dryRun} protect=${opts.protect.length} recentActivityGraceMs=${opts.recentActivityGraceMs} dbPath=${resolveOpencodeDbPath(opts.dbPath)}`,
       );
     },
     tool: {

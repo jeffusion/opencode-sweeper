@@ -1,6 +1,6 @@
 {
   "name": "opencode-sweeper",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "type": "module",
   "license": "MIT",
   "description": "opencode plugin that sweeps expired sessions and subagents on a configurable schedule, with a /sweep slash command for manual cleanup.",

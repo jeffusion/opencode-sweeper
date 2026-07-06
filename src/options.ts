@@ -7,6 +7,8 @@ export type SweeperOptions = {
   dryRun: boolean;
   protect: string[];
   recentActivityGraceMs: number;
+  /** Optional override for the opencode SQLite DB path; default auto-resolves via resolveOpencodeDbPath(). */
+  dbPath?: string;
 };
 
 type OptionSource = Record<string, unknown> & {
@@ -20,6 +22,7 @@ type OptionSource = Record<string, unknown> & {
   readonly recentActivityGraceMs?: unknown;
   readonly subagentExpiry?: unknown;
   readonly subagentExpiryMs?: unknown;
+  readonly dbPath?: unknown;
 };
 
 const DEFAULT_EXPIRY_MS = 2_592_000_000; // 30d
@@ -39,6 +42,7 @@ const KNOWN_OPTION_KEYS = new Set<string>([
   "recentActivityGraceMs",
   "subagentExpiry",
   "subagentExpiryMs",
+  "dbPath",
 ]);
 
 function hasOwn(value: Record<string, unknown>, key: string): boolean {
@@ -125,6 +129,20 @@ function assertKnownOptions(raw: Record<string, unknown>): void {
   }
 }
 
+function readDbPathOption(value: unknown): string | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (typeof value !== "string") {
+    throw new TypeError("dbPath must be string");
+  }
+  const trimmed = value.trim();
+  if (trimmed.length === 0) {
+    throw new TypeError("dbPath must be non-empty string");
+  }
+  return trimmed;
+}
+
 export function parseOptions(raw: Record<string, unknown> | undefined): SweeperOptions {
   const source: OptionSource = raw ?? {};
 
@@ -181,5 +199,6 @@ export function parseOptions(raw: Record<string, unknown> | undefined): SweeperO
     dryRun: readBooleanOption(source.dryRun),
     protect: readProtectOption(source.protect),
     recentActivityGraceMs,
+    dbPath: readDbPathOption(source.dbPath),
   };
 }

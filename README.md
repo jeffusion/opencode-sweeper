@@ -55,6 +55,7 @@ For local development, install via `file://`:
 | `protect` | `string[]` | `[]` | Session IDs that must never be deleted. **Auto-populated with the running session's ID when `/sweep` is invoked** — manual add not needed for the manual path. Honored for both main and subagent sessions. |
 | `recentActivityGrace` | `string \| number` | `"1h"` | Sessions touched within this window are skipped **regardless of main/subagent status** — shared grace period for both thresholds. Protects sessions you or other tools recently interacted with. |
 | `recentActivityGraceMs` | `number` | — | Override-raw-milliseconds form of `recentActivityGrace`. |
+| `dbPath` | `string` | — | Optional override for the opencode SQLite DB path. Default auto-resolves via `XDG_DATA_HOME` (Linux) or platform default (`~/.local/share/opencode/opencode.db` on Linux, `~/Library/Application Support/opencode/opencode.db` on macOS). Set only when running against a non-standard opencode install.
 
 Unknown options are rejected — typos fail loud, not silent.
 
@@ -126,6 +127,26 @@ Disable the timer: `"interval": 0`.
 
 A single pass over `client.session.list()` is sufficient — main and subagent sessions are partitioned by their threshold alone, not by separate passes. See [Warning A](#warning-a-sessiondelete-is-recursive) for the cascade implication.
 
+### Session listing path: direct SQLite read (not the SDK)
+
+The plugin gets its session list by **reading the opencode SQLite database directly `readonly`**, not by calling the opencode SDK's `session.list()`. This is a deliberate architectural choice driven by two hard limits of the SDK API in opencode 1.17.x (verified against `sst/opencode` `session.ts` SHA `68f225a`):
+
+1. **The SDK list filters by `project_id = current_instance.project.id`** (`listByProject` L964). A plugin loaded in project A can never see sessions belonging to project B. Sweeping all your projects is impossible via the SDK.
+2. **The SDK list caps at 100 rows** (`limit ?? 100` L997, `order by time_updated desc` L1003) — the latest 100 only. Sessions older than that cutoff — which is precisely the surface a sweeper needs — are invisible to the SDK.
+
+To actually clean stale sessions across all projects, the plugin opens the opencode DB directly via the runtime's built-in SQLite backend (Bun: `bun:sqlite`; Node/Electron: `node:sqlite` `DatabaseSync`). The same shipped artifact runs under both runtimes via dynamic `import()` gated by a `typeof Bun` probe — this mirrors `@cortexkit/opencode-magic-context` `shared/sqlite.ts`. `better-sqlite3` is deliberately avoided (per-ABI prebuild downloads are a supply-chain liability; the built-in backends are flag-free).
+
+**Safety invariants of the SQLite path:**
+
+- The DB is opened `readonly` (`bun:sqlite` `{ readonly: true }`, `node:sqlite` `DatabaseSync({ readOnly: true })`). The plugin never writes, never ATTACHes, never mutates pragmas.
+- opencode 1.17 uses WAL journal mode (verified on a live `opencode.db`), so a readonly reader cannot block opencode's writer path.
+- The plugin only selects the columns it reads: `id, project_id, parent_id, title, directory, time_created, time_updated, time_compacting, time_archived`. A `PRAGMA table_info(session)` schema guard at startup throws `SchemaMismatchError` if any required column is missing in a future opencode schema migration — the sweeper degrades loud, not silent.
+- The DELETE path still goes through the opencode SDK's `session.delete()`, so opencode's reverse recursive child cleanup (`Session.remove` → `children()` recursion, verified in `sst/opencode` `session/session.ts` SHA `68f225a`) keeps working. The mixed read(SQLite) + write(SDK) split avoids both the SDK scan blind spot *and* the risk of a direct-sqlite DELETE bypassing app-layer child cleanup.
+
+**What this means for the cascade cost:** when the plugin lists a parent from SQLite, the SDK `session.delete(parent)` recurses through the SDK's own `children()` call — so dependent child rows are removed via opencode, not via the sweeper's own SQLite writes. The plugin is read-only on the DB even at the cascade layer.
+
+If `dbPath` is not set in the plugin options, the path auto-resolves via `XDG_DATA_HOME` (Linux precedence) or platform default (`~/.local/share/opencode/opencode.db` on Linux, `~/Library/Application Support/opencode/opencode.db` on macOS). Use the `dbPath` option only when running against a non-standard opencode install.
+
 ## Warnings
 
 ### Warning A: `session.delete` recursion and dual-threshold interaction
@@ -182,12 +203,14 @@ Layout:
 ```
 src/
   duration.ts   # parse "7d"/"24h"/"30m"/"60s"/"Nms" -> milliseconds
-  options.ts    # parse plugin options -> typed SweeperOptions
+  options.ts    # parse plugin options -> typed SweeperOptions (includes dbPath override)
+  db.ts         # readonly sqlite scan layer (bun:sqlite/node:sqlite runtime-detected)
   sweep.ts      # core runSweep (mockable SweeperClient interface)
-  index.ts      # opencode server plugin default export
+  index.ts      # opencode server plugin default export (PluginModule shape)
 tests/
   duration.test.ts
   options.test.ts
+  db.test.ts              # SQLite scan layer (real temp DB, schema guard, cross-project read)
   sweep.behavior.ts + sweep.edge.ts + sweep.mixed.ts + sweep.test.ts
   sweep-support.ts        # shared MockSweeperClient + session factory
   config-inject.test.ts   # config hook injects `sweep` into Config.command
