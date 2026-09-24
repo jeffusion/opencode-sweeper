@@ -316,3 +316,7 @@ The unit tests cover the option parser, shared cleanup algorithm, V1 config hook
 2. Start/restart the V2 host. Verify the `sweep` tool and `/sweep` command are available; invoke `/sweep` and confirm the summary is returned.
 3. Check the host's console output for `opencode-sweeper timer sweep` or `opencode-sweeper timer error`. The minimum non-zero interval is `1m`; allow at least one interval for the first timer tick.
 4. V2 checks fresh pagination, active sessions, protected ancestors, and the candidate's complete subtree before each removal. These checks are not atomic with the server-side removal; a session may change after the checks. Unload/cancellation does not retract a DELETE already accepted by the server. Review dry-run output before setting `dryRun` to `false`.
+
+## Release
+
+发布流程由 Release Please 自动化（版本计算、Release PR、GitHub Release 与 npm 发布）。维护者请阅读 [RELEASING.md](./RELEASING.md)。

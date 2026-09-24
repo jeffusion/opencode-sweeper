@@ -1,31 +1,70 @@
-name: Publish
-
-# Tag-triggered npm publish via Trusted Publishing (OIDC).
-# Modern 2025-2026 community standard — replaces NPM_TOKEN + semantic-release.
-# Requires one-time manual setup: add a Trusted Publisher on
-# https://www.npmjs.com/package/opencode-sweeper/access pointing at
-# jeffusion/opencode-sweeper with workflow filename `release.yml`.
+name: Release Please
 
 on:
   push:
-    tags:
-      - "v*"
+    branches: [main]
+  workflow_dispatch:
 
-permissions:
-  contents: read
-  id-token: write  # Required for npm Trusted Publishing (OIDC)
+permissions: {}
+
+concurrency:
+  group: release-please-main
+  cancel-in-progress: false
 
 jobs:
-  publish:
+  release-please:
+    if: ${{ github.ref == 'refs/heads/main' && github.repository == 'jeffusion/opencode-sweeper' }}
     runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
     steps:
-      - name: Checkout
+      - name: Check GitHub App credentials
+        env:
+          RELEASE_APP_ID: ${{ vars.RELEASE_APP_ID }}
+          RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+        run: |
+          if [ -z "$RELEASE_APP_ID" ] || [ -z "$RELEASE_APP_PRIVATE_KEY" ]; then
+            echo "::error::GitHub App credentials are not configured."
+            exit 1
+          fi
+
+      - name: Create GitHub App token
+        id: app_token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+
+      - name: Release Please
+        id: release
+        uses: googleapis/release-please-action@v4
+        with:
+          token: ${{ steps.app_token.outputs.token }}
+          config-file: .release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  publish:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created == 'true' && vars.NPM_PUBLISH_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout published release tag
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
+          fetch-depth: 0
 
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: 1.4.2
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
@@ -39,17 +78,44 @@ jobs:
       - name: Test
         run: bun test
 
+      - name: Test sweep cascade
+        run: bun test ./tests/sweep.cascade.ts
+
+      - name: Record source metadata hashes
+        run: sha256sum package.json .release-please-manifest.json bun.lock > "$RUNNER_TEMP/release-metadata.sha256"
+
       - name: Build
         run: bun run build
 
-      - name: Set up Node.js for npm publish (OIDC Trusted Publishing)
+      - name: Verify build did not modify release metadata
+        run: sha256sum --check "$RUNNER_TEMP/release-metadata.sha256"
+
+      - name: Set up Node.js for npm Trusted Publishing
         uses: actions/setup-node@v4
         with:
-          node-version: "24"
+          node-version: 24
           registry-url: https://registry.npmjs.org
+          package-manager-cache: false
 
-      - name: Ensure npm supports Trusted Publishing (>= 11.5.1)
-        run: npm install -g npm@^11.5.2
+      - name: Verify release metadata and tool versions
+        env:
+          RELEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          node --version
+          npm --version
+          node -e 'const [major, minor] = process.versions.node.split(".").map(Number); if (major < 24) throw new Error("Node 24 or newer is required")'
+          node -e 'const { execFileSync } = require("node:child_process"); const [major, minor, patch] = execFileSync("npm", ["--version"], { encoding: "utf8" }).trim().split(".").map(Number); if (major < 11 || (major === 11 && minor < 5) || (major === 11 && minor === 5 && patch < 1)) throw new Error("npm 11.5.1 or newer is required")'
+          node scripts/check-release.mjs metadata
 
-      - name: Publish to npm (Trusted Publishing — no NPM_TOKEN, no NODE_AUTH_TOKEN)
+      - name: Verify npm registry state
+        env:
+          RELEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: node scripts/check-release.mjs registry
+
+      - name: Verify npm package contents
+        run: npm pack --dry-run --json | node scripts/check-release.mjs pack
+
+      - name: Publish package
         run: npm publish --access public
