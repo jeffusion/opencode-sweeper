@@ -1,5 +1,6 @@
 import type { Hooks, Plugin, PluginInput, PluginModule, PluginOptions } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
+import type { Plugin as PluginV2 } from "@opencode/plugin";
 import { type SessionRow, listSessions, resolveOpencodeDbPath, rowToSessionLike } from "./db.js";
 import { type SweeperOptions, parseOptions } from "./options.js";
 import { type SessionLike, type SweepResult, type SweeperClient, runSweep } from "./sweep.js";
@@ -20,6 +21,7 @@ function formatSweepSummary(r: SweepResult): string {
     `recentActive skipped: ${r.recentActiveSkipped}`,
     `main notExpired skipped: ${r.mainNotExpiredSkipped}`,
     `subagent notExpired skipped: ${r.subagentNotExpiredSkipped}`,
+    `cascadeBlocked skipped: ${r.cascadeBlockedSkipped}`,
     `dryRun skipped: ${r.dryRunSkipped}`,
     `errors: ${r.errors.length}`,
   ];
@@ -179,4 +181,10 @@ const server: Plugin = async (input: PluginInput, options?: PluginOptions) => {
 // not surface plugin tools to the LLM tool registry even though the `config` hook still
 // fires — that was the v0.1.1 regression where `/sweep` appeared in the TUI palette
 // but the LLM could not actually invoke the `sweep` tool.
-export default { id: "opencode-sweeper", server } satisfies PluginModule;
+async function setup(ctx: PluginV2.Context): Promise<PluginV2.Cleanup> {
+  // Keep the V2 runtime and client out of the V1 loading path.
+  const { setupV2 } = await import("./v2.js");
+  return setupV2(ctx);
+}
+
+export default { id: "opencode-sweeper", server, setup } as PluginModule & { setup: typeof setup };

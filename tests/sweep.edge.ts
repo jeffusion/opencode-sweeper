@@ -107,6 +107,7 @@ describe("runSweep edge cases", () => {
         recentActiveSkipped: 0,
         mainNotExpiredSkipped: 0,
         subagentNotExpiredSkipped: 0,
+        cascadeBlockedSkipped: 0,
         dryRunSkipped: 0,
         errors: [],
         deletions: [],
