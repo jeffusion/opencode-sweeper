@@ -4,6 +4,7 @@ import type { Plugin as PluginV2 } from "@opencode/plugin";
 import { type SessionRow, listSessions, resolveOpencodeDbPath, rowToSessionLike } from "./db.js";
 import { type SweeperOptions, parseOptions } from "./options.js";
 import { type SessionLike, type SweepResult, type SweeperClient, runSweep } from "./sweep.js";
+import { updatePluginVersion } from "./update.js";
 
 const SERVICE_NAME = "opencode-sweeper";
 const TOOL_NAME = "sweep";
@@ -107,70 +108,94 @@ function makeSweepTool(
   });
 }
 
-const server: Plugin = async (input: PluginInput, options?: PluginOptions) => {
-  const opts = parseOptions(options);
-  const protectedSessions = new Set<string>(opts.protect);
-  const client = buildSweeperClient(input, opts);
+export function createServer(updateFn: typeof updatePluginVersion = updatePluginVersion): Plugin {
+  return async (input: PluginInput, options?: PluginOptions) => {
+    const opts = parseOptions(options);
+    const protectedSessions = new Set<string>(opts.protect);
+    const client = buildSweeperClient(input, opts);
 
-  let timer: ReturnType<typeof setInterval> | undefined;
-  if (opts.intervalMs > 0) {
-    const tick = async () => {
-      try {
-        const result = await runSweep(client, opts, protectedSessions);
-        await logInfo(input, `timer sweep: ${formatSweepSummary(result)}`);
-      } catch (error) {
+    let timer: ReturnType<typeof setInterval> | undefined;
+    if (opts.intervalMs > 0) {
+      const tick = async () => {
+        try {
+          const result = await runSweep(client, opts, protectedSessions);
+          await logInfo(input, `timer sweep: ${formatSweepSummary(result)}`);
+        } catch (error) {
+          await logInfo(
+            input,
+            `timer sweep error: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      };
+      timer = setInterval(() => {
+        void tick();
+      }, opts.intervalMs);
+      // unref is required for `opencode run` one-shots to exit between ticks;
+      // matches @cortexkit/opencode-magic-context dream-timer.ts pattern.
+      if (typeof timer === "object" && "unref" in timer) {
+        timer.unref();
+      }
+    }
+
+    const hooks: Hooks = {
+      config: async (config) => {
+        // Inject `sweep` into Config.command so opencode surfaces it in the TUI
+        // slash palette. Mechanism: opencode's ACP flows config.command through
+        // `available_commands_update` into TUI's `sync().data.command`, which
+        // prompt-input.tsx renders as the `/` popover (opencode@68f225a).
+        // User-declared `sweep` in opencode.json takes precedence over our default.
+        const existing = config.command?.[COMMAND_NAME];
+        config.command = {
+          ...(config.command ?? {}),
+          [COMMAND_NAME]: {
+            template: existing?.template ?? COMMAND_TEMPLATE,
+            description: existing?.description ?? COMMAND_DESCRIPTION,
+            ...(existing?.agent !== undefined ? { agent: existing.agent } : {}),
+            ...(existing?.model !== undefined ? { model: existing.model } : {}),
+            ...(existing?.subtask !== undefined ? { subtask: existing.subtask } : {}),
+          },
+        };
+        const logUpdate = (message: string): void => {
+          void logInfo(input, message).catch((error: unknown) => {
+            console.error("opencode-sweeper update log failed", error);
+          });
+        };
+        void Promise.resolve()
+          .then(() =>
+            updateFn(config as unknown, {
+              onSuccess: (version) => {
+                logUpdate(
+                  `updated config pin to opencode-sweeper@${version}; restart OpenCode to apply`,
+                );
+              },
+            }),
+          )
+          .catch((error: unknown) => {
+            logUpdate(
+              `update check failed: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          });
         await logInfo(
           input,
-          `timer sweep error: ${error instanceof Error ? error.message : String(error)}`,
+          `loaded: expiryMs=${opts.expiryMs} subagentExpiryMs=${opts.subagentExpiryMs} intervalMs=${opts.intervalMs} dryRun=${opts.dryRun} protect=${opts.protect.length} recentActivityGraceMs=${opts.recentActivityGraceMs} dbPath=${resolveOpencodeDbPath(opts.dbPath)}`,
         );
-      }
+      },
+      tool: {
+        [TOOL_NAME]: makeSweepTool(client, opts, protectedSessions, input),
+      },
+      dispose: async () => {
+        if (timer !== undefined) {
+          clearInterval(timer);
+          timer = undefined;
+        }
+      },
     };
-    timer = setInterval(() => {
-      void tick();
-    }, opts.intervalMs);
-    // unref is required for `opencode run` one-shots to exit between ticks;
-    // matches @cortexkit/opencode-magic-context dream-timer.ts pattern.
-    if (typeof timer === "object" && "unref" in timer) {
-      timer.unref();
-    }
-  }
 
-  const hooks: Hooks = {
-    config: async (config) => {
-      // Inject `sweep` into Config.command so opencode surfaces it in the TUI
-      // slash palette. Mechanism: opencode's ACP flows config.command through
-      // `available_commands_update` into TUI's `sync().data.command`, which
-      // prompt-input.tsx renders as the `/` popover (opencode@68f225a).
-      // User-declared `sweep` in opencode.json takes precedence over our default.
-      const existing = config.command?.[COMMAND_NAME];
-      config.command = {
-        ...(config.command ?? {}),
-        [COMMAND_NAME]: {
-          template: existing?.template ?? COMMAND_TEMPLATE,
-          description: existing?.description ?? COMMAND_DESCRIPTION,
-          ...(existing?.agent !== undefined ? { agent: existing.agent } : {}),
-          ...(existing?.model !== undefined ? { model: existing.model } : {}),
-          ...(existing?.subtask !== undefined ? { subtask: existing.subtask } : {}),
-        },
-      };
-      await logInfo(
-        input,
-        `loaded: expiryMs=${opts.expiryMs} subagentExpiryMs=${opts.subagentExpiryMs} intervalMs=${opts.intervalMs} dryRun=${opts.dryRun} protect=${opts.protect.length} recentActivityGraceMs=${opts.recentActivityGraceMs} dbPath=${resolveOpencodeDbPath(opts.dbPath)}`,
-      );
-    },
-    tool: {
-      [TOOL_NAME]: makeSweepTool(client, opts, protectedSessions, input),
-    },
-    dispose: async () => {
-      if (timer !== undefined) {
-        clearInterval(timer);
-        timer = undefined;
-      }
-    },
+    return hooks;
   };
+}
 
-  return hooks;
-};
+const server: Plugin = createServer();
 
 // Default export MUST be the `PluginModule` shape `{ id, server }` rather than a bare
 // `Plugin` function. opencode's `applyPlugin` → `readV1Plugin(mode="detect")` only
