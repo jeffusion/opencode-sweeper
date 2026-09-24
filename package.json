@@ -1,6 +1,6 @@
 {
   "name": "opencode-sweeper",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "type": "module",
   "license": "MIT",
   "description": "opencode plugin that sweeps expired sessions and subagents on a configurable schedule, with a /sweep slash command for manual cleanup.",
@@ -13,7 +13,14 @@
   "bugs": {
     "url": "https://github.com/jeffusion/opencode-sweeper/issues"
   },
-  "keywords": ["opencode", "opencode-plugin", "session", "cleanup", "sweep", "subagent"],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "session",
+    "cleanup",
+    "sweep",
+    "subagent"
+  ],
   "main": "./dist/index.js",
   "bin": {
     "opencode-sweeper": "./dist/cli.js"
@@ -28,7 +35,10 @@
       "types": "./dist/v2.d.ts"
     }
   },
-  "files": ["dist", "server.js"],
+  "files": [
+    "dist",
+    "server.js"
+  ],
   "publishConfig": {
     "access": "public"
   },
