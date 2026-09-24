@@ -25,6 +25,34 @@ function asClient(value: unknown): TestClient {
   return value as TestClient;
 }
 
+function setupContext(list: () => Promise<unknown>, intervalMs = 0) {
+  return {
+    options: { intervalMs },
+    location: { directory: "/project" },
+    session: { prompt: mock(async () => undefined) },
+    plugin: { list: mock(list) },
+    tool: {
+      transform: (edit: (editor: TestEditor) => void) =>
+        edit({ add: () => undefined, get: () => undefined }),
+    },
+    command: {
+      list: mock(async () => ({ location: { directory: "/project" }, data: [] })),
+      transform: (edit: (editor: TestCommandEditor) => void) => edit({ add: () => undefined }),
+    },
+  };
+}
+
+const activePackage = {
+  id: "opencode-sweeper",
+  source: { type: "package", target: "opencode-sweeper@1.0.0" },
+  features: { server: true },
+  state: { status: "active" },
+};
+
+function pluginListResult(data: unknown[], directory = "/project") {
+  return { location: { directory }, data };
+}
+
 test("V2 registers sweep tool and command; command resumes its session", async () => {
   let toolDefinition: TestTool | undefined;
   let commandDefinition: TestCommand | undefined;
@@ -40,6 +68,7 @@ test("V2 registers sweep tool and command; command resumes its session", async (
     options: { intervalMs: 0, dryRun: true },
     location: { directory: "/project" },
     session: { prompt },
+    plugin: { list: mock(async () => ({ location: { directory: "/project" }, data: [] })) },
     tool: {
       transform: (edit: (editor: TestEditor) => void) => {
         edit({
@@ -82,6 +111,7 @@ test("V2 leaves a user-defined sweep command intact", async () => {
     options: { intervalMs: 0 },
     location: { directory: "/project" },
     session: { prompt: mock(async () => undefined) },
+    plugin: { list: mock(async () => ({ location: { directory: "/project" }, data: [] })) },
     tool: {
       transform: (edit: (editor: TestEditor) => void) => {
         edit({ add: () => undefined, get: () => undefined });
@@ -97,6 +127,147 @@ test("V2 leaves a user-defined sweep command intact", async () => {
   const cleanup = await setupV2(ctx as unknown as Parameters<typeof setupV2>[0]);
   expect(commandTransformCalls).toBe(0);
   cleanup();
+});
+
+test("V2 auto-update retries an initially empty plugin list even when interval is disabled", async () => {
+  let lists = 0;
+  let runnerCalls = 0;
+  const ctx = setupContext(async () => pluginListResult(++lists === 1 ? [] : [activePackage]));
+  const runAutoUpdate: NonNullable<Parameters<typeof setupV2>[1]>["runAutoUpdate"] = async (
+    location,
+    dependencies,
+  ) => {
+    runnerCalls += 1;
+    expect(location).toBe("/project");
+    expect(await dependencies.sourceCheck()).toBe("opencode-sweeper@1.0.0");
+    return false;
+  };
+  const cleanup = await setupV2(ctx as unknown as Parameters<typeof setupV2>[0], {
+    runAutoUpdate,
+    retryDelayMs: 1,
+  });
+  for (let i = 0; i < 50 && runnerCalls === 0; i += 1)
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  expect(lists).toBe(3); // empty initial poll, verified poll, runner's fresh proof
+  expect(runnerCalls).toBe(1);
+  await cleanup();
+});
+
+test("V2 rejects local, failed, duplicate, and wrong-location plugin.list results before runner", async () => {
+  const invalidResults = [
+    pluginListResult([{ ...activePackage, source: { type: "local", path: "/local" } }]),
+    pluginListResult([{ ...activePackage, state: { status: "failed" } }]),
+    pluginListResult([activePackage, activePackage]),
+    pluginListResult([activePackage], "/other"),
+    pluginListResult([{ ...activePackage, source: { type: "package", target: "file:/local" } }]),
+  ];
+  for (const result of invalidResults) {
+    const list = mock(async () => result);
+    const ctx = setupContext(list);
+    let runnerCalls = 0;
+    const cleanup = await setupV2(ctx as unknown as Parameters<typeof setupV2>[0], {
+      runAutoUpdate: (async () => {
+        runnerCalls += 1;
+        return false;
+      }) as NonNullable<Parameters<typeof setupV2>[1]>["runAutoUpdate"],
+      retryDelayMs: 1,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(list).toHaveBeenCalledTimes(1);
+    expect(runnerCalls).toBe(0);
+    await cleanup();
+  }
+});
+
+test("V2 cleanup cancels the scheduled poll and aborts/waits for an in-flight updater", async () => {
+  const pendingList = setupContext(async () => pluginListResult([activePackage]));
+  let preCleanupRunnerCalls = 0;
+  const preCleanup = await setupV2(pendingList as unknown as Parameters<typeof setupV2>[0], {
+    runAutoUpdate: (async () => {
+      preCleanupRunnerCalls += 1;
+      return false;
+    }) as NonNullable<Parameters<typeof setupV2>[1]>["runAutoUpdate"],
+  });
+  await preCleanup();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(preCleanupRunnerCalls).toBe(0);
+
+  const ctx = setupContext(async () => pluginListResult([activePackage]));
+  let signal: AbortSignal | undefined;
+  let resolveUpdate!: () => void;
+  const cleanup = await setupV2(ctx as unknown as Parameters<typeof setupV2>[0], {
+    runAutoUpdate: (async (_location, dependencies) => {
+      signal = dependencies.signal;
+      return await new Promise<boolean>((resolve) => {
+        resolveUpdate = () => resolve(false);
+      });
+    }) as NonNullable<Parameters<typeof setupV2>[1]>["runAutoUpdate"],
+  });
+  for (let i = 0; i < 50 && !resolveUpdate; i += 1)
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  let cleanupComplete = false;
+  const cleaning = cleanup().then(() => {
+    cleanupComplete = true;
+  });
+  expect(signal?.aborted).toBe(true);
+  await Promise.resolve();
+  expect(cleanupComplete).toBe(false);
+  resolveUpdate();
+  await cleaning;
+  expect(cleanupComplete).toBe(true);
+});
+
+test("V2 cleanup does not wait forever for an unresolved plugin.list", async () => {
+  const list = mock(() => new Promise<unknown>(() => {}));
+  const ctx = setupContext(list);
+  let runnerCalls = 0;
+  let writes = 0;
+  const cleanup = await setupV2(ctx as unknown as Parameters<typeof setupV2>[0], {
+    runAutoUpdate: (async () => {
+      runnerCalls += 1;
+      writes += 1;
+      return true;
+    }) as NonNullable<Parameters<typeof setupV2>[1]>["runAutoUpdate"],
+  });
+  for (let i = 0; i < 50 && list.mock.calls.length === 0; i += 1)
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  expect(list).toHaveBeenCalledTimes(1);
+  await Promise.race([
+    cleanup(),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("cleanup hung")), 100)),
+  ]);
+  expect(runnerCalls).toBe(0);
+  expect(writes).toBe(0);
+});
+
+test("V2 abort interrupts plugin.list used by runner sourceCheck without fetch or writes", async () => {
+  let listCalls = 0;
+  const ctx = setupContext(async () => {
+    listCalls += 1;
+    if (listCalls === 1) return pluginListResult([activePackage]);
+    return await new Promise<unknown>(() => {});
+  });
+  let registryCalls = 0;
+  let writes = 0;
+  const cleanup = await setupV2(ctx as unknown as Parameters<typeof setupV2>[0], {
+    runAutoUpdate: (async (_location, dependencies) => {
+      const source = await dependencies.sourceCheck();
+      if (source === false || dependencies.signal?.aborted) return false;
+      registryCalls += 1;
+      if (dependencies.signal?.aborted) return false;
+      writes += 1;
+      return true;
+    }) as NonNullable<Parameters<typeof setupV2>[1]>["runAutoUpdate"],
+  });
+  for (let i = 0; i < 50 && listCalls < 2; i += 1)
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  expect(listCalls).toBe(2);
+  await Promise.race([
+    cleanup(),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("cleanup hung")), 100)),
+  ]);
+  expect(registryCalls).toBe(0);
+  expect(writes).toBe(0);
 });
 
 test("local OpenCode host resolution discovers the package server entry", () => {

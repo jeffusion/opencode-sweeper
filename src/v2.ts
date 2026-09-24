@@ -2,10 +2,43 @@ import { OpenCode, isSessionNotFoundError } from "@opencode/client";
 import type { SessionInfo } from "@opencode/client";
 import { Service } from "@opencode/client/service";
 import type { Plugin } from "@opencode/plugin";
+import { hasVerifiedPackagePlugin, runV2AutoUpdate } from "./auto-update-v2.js";
 import { parseOptions } from "./options.js";
 import { type SessionLike, type SweepResult, type SweeperClient, runSweep } from "./sweep.js";
 
 type SetupContext = Plugin.Context;
+type AutoUpdateRunner = typeof runV2AutoUpdate;
+type SetupV2Options = { runAutoUpdate?: AutoUpdateRunner; retryDelayMs?: number };
+const ABORTED_AUTO_UPDATE = Symbol("aborted auto-update");
+
+function awaitAbortable<T>(
+  promise: Promise<T>,
+  signal: AbortSignal,
+): Promise<T | typeof ABORTED_AUTO_UPDATE> {
+  if (signal.aborted) return Promise.resolve(ABORTED_AUTO_UPDATE);
+  return new Promise((resolve, reject) => {
+    const cleanup = () => signal.removeEventListener("abort", onAbort);
+    const onAbort = () => {
+      cleanup();
+      resolve(ABORTED_AUTO_UPDATE);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
+    void promise.then(
+      (value) => {
+        cleanup();
+        resolve(value);
+      },
+      (error: unknown) => {
+        cleanup();
+        reject(error);
+      },
+    );
+  });
+}
 
 const COMMAND_TEMPLATE =
   "Run the `sweep` tool now and report its result back to the user verbatim. Do not summarize or omit counts.";
@@ -328,7 +361,10 @@ function formatSweepSummary(r: Awaited<ReturnType<typeof sweepWithClient>>): str
   return lines.join("\n");
 }
 
-export async function setupV2(ctx: SetupContext): Promise<Plugin.Cleanup> {
+export async function setupV2(
+  ctx: SetupContext,
+  dependencies: SetupV2Options = {},
+): Promise<Plugin.Cleanup> {
   const opts = parseOptions(ctx.options);
   const directory = ctx.location.directory;
   const protectedIDs = new Set(opts.protect);
@@ -371,6 +407,93 @@ export async function setupV2(ctx: SetupContext): Promise<Plugin.Cleanup> {
     );
   }
 
+  const runAutoUpdate = dependencies.runAutoUpdate ?? runV2AutoUpdate;
+  const retryDelayMs = dependencies.retryDelayMs ?? 200;
+  let autoUpdateTimer: ReturnType<typeof setTimeout> | undefined;
+  let autoUpdateTask: Promise<void> | undefined;
+  const waitForRetry = () =>
+    new Promise<void>((resolve) => {
+      if (lifecycle.signal.aborted) return resolve();
+      const timer = setTimeout(done, retryDelayMs);
+      function done() {
+        clearTimeout(timer);
+        lifecycle.signal.removeEventListener("abort", done);
+        resolve();
+      }
+      lifecycle.signal.addEventListener("abort", done, { once: true });
+    });
+  const sourceCheck = async (): Promise<string | false> => {
+    if (lifecycle.signal.aborted) return false;
+    try {
+      const result: unknown | typeof ABORTED_AUTO_UPDATE = await awaitAbortable(
+        Promise.resolve().then(() => ctx.plugin.list({ location: { directory } })),
+        lifecycle.signal,
+      );
+      if (result === ABORTED_AUTO_UPDATE || lifecycle.signal.aborted) return false;
+      return hasVerifiedPackagePlugin(result, directory);
+    } catch {
+      return false;
+    }
+  };
+  const checkForAutoUpdate = async () => {
+    for (let attempt = 0; attempt < 5 && !lifecycle.signal.aborted; attempt += 1) {
+      let result: unknown;
+      try {
+        const listed: unknown | typeof ABORTED_AUTO_UPDATE = await awaitAbortable(
+          Promise.resolve().then(() => ctx.plugin.list({ location: { directory } })),
+          lifecycle.signal,
+        );
+        if (listed === ABORTED_AUTO_UPDATE) return;
+        result = listed;
+      } catch {
+        console.warn("opencode-sweeper V2 auto-update check failed");
+        return;
+      }
+      if (lifecycle.signal.aborted) return;
+      if (
+        result === null ||
+        typeof result !== "object" ||
+        Array.isArray(result) ||
+        !("location" in result) ||
+        !result.location ||
+        typeof result.location !== "object" ||
+        !("directory" in result.location) ||
+        result.location.directory !== directory ||
+        !("data" in result) ||
+        !Array.isArray(result.data)
+      )
+        return;
+      const hasPackageId = result.data.some(
+        (plugin) =>
+          plugin !== null &&
+          typeof plugin === "object" &&
+          "id" in plugin &&
+          plugin.id === "opencode-sweeper",
+      );
+      if (hasPackageId) {
+        const target = hasVerifiedPackagePlugin(result, directory);
+        if (!target || lifecycle.signal.aborted) return;
+        try {
+          await runAutoUpdate(directory, {
+            sourceCheck,
+            signal: lifecycle.signal,
+            log: (message) => console.info(message),
+          });
+        } catch {
+          if (!lifecycle.signal.aborted)
+            console.warn("opencode-sweeper V2 auto-update check failed");
+        }
+        return;
+      }
+      if (attempt < 4) await waitForRetry();
+    }
+  };
+  autoUpdateTimer = setTimeout(() => {
+    autoUpdateTimer = undefined;
+    autoUpdateTask = checkForAutoUpdate();
+  }, 0);
+  if (typeof autoUpdateTimer === "object" && "unref" in autoUpdateTimer) autoUpdateTimer.unref();
+
   let timer: ReturnType<typeof setInterval> | undefined;
   if (opts.intervalMs > 0) {
     timer = setInterval(() => {
@@ -385,7 +508,9 @@ export async function setupV2(ctx: SetupContext): Promise<Plugin.Cleanup> {
   console.info("opencode-sweeper V2 loaded", { ...opts, dbPath: undefined });
   return async () => {
     lifecycle.abort(new Error("opencode-sweeper plugin unloaded"));
+    if (autoUpdateTimer) clearTimeout(autoUpdateTimer);
     if (timer) clearInterval(timer);
+    await autoUpdateTask;
     await sweepInvoker.wait();
   };
 }
