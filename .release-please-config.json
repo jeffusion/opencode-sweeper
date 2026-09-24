@@ -1,0 +1,13 @@
+{
+  "release-type": "node",
+  "packages": {
+    ".": {
+      "release-type": "node"
+    }
+  },
+  "include-component-in-tag": false,
+  "include-v-in-tag": true,
+  "bump-minor-pre-major": true,
+  "bump-patch-for-minor-pre-major": false,
+  "bootstrap-sha": "d3b5c6d11ec460191f0fc25622f4cafc298bd6a6"
+}
