@@ -19,14 +19,18 @@
     "./server": {
       "import": "./dist/index.js",
       "types": "./dist/index.d.ts"
+    },
+    "./server-v2": {
+      "import": "./dist/v2.js",
+      "types": "./dist/v2.d.ts"
     }
   },
-  "files": ["dist"],
+  "files": ["dist", "server.js"],
   "publishConfig": {
     "access": "public"
   },
   "scripts": {
-    "build": "bun build src/index.ts --outdir dist --target bun && bunx tsc --emitDeclarationOnly --declaration --outDir dist",
+    "build": "bun build src/index.ts src/v2.ts --outdir dist --target bun && bunx tsc --emitDeclarationOnly --declaration --outDir dist",
     "test": "bun test",
     "typecheck": "bunx tsc --noEmit",
     "lint": "bunx biome check ."
@@ -39,6 +43,8 @@
   "dependencies": {
     "@opencode-ai/plugin": "^1.17.0",
     "@opencode-ai/sdk": "^1.17.0",
+    "@opencode/client": "2.0.15",
+    "@opencode/plugin": "2.0.15",
     "zod": "^3.23.0"
   }
 }
