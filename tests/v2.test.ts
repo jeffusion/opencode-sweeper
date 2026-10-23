@@ -2,7 +2,7 @@ import { expect, mock, test } from "bun:test";
 import { resolve } from "node:path";
 import { resolve as resolveHost } from "@opencode/plugin/host";
 import { parseOptions } from "../src/options.js";
-import { createSweepInvoker, listAll, setupV2, sweepWithClient } from "../src/v2.js";
+import { createSweepInvoker, listAll, redactError, setupV2, sweepWithClient } from "../src/v2.js";
 
 type TestTool = {
   name: string;
@@ -575,4 +575,58 @@ test("a tool signal cancels a sweep already started by the timer", async () => {
   await expect(timerRun).rejects.toThrow("sweep aborted before DELETE");
   expect(remove).not.toHaveBeenCalled();
   await invoker.wait();
+});
+
+test("V2 log formatting redacts authorization and secret values", () => {
+  const encoded = Buffer.from("opencode:secret", "utf8").toString("base64");
+  const formatted = redactError(new Error(`request failed authorization: Basic ${encoded}`));
+  expect(formatted).not.toContain(encoded);
+  expect(formatted).toContain("[redacted]");
+
+  const fields = redactError(new Error("password=hunter2 token=abc123"));
+  expect(fields).not.toContain("hunter2");
+  expect(fields).not.toContain("abc123");
+
+  // Non-Error values may be raw config/env objects; only a fixed message is logged.
+  expect(redactError({ authorization: `Basic ${encoded}` })).toBe("Error: unexpected error");
+
+  const previousPassword = process.env.OPENCODE_SERVER_PASSWORD;
+  process.env.OPENCODE_SERVER_PASSWORD = "env-only-secret";
+  try {
+    expect(redactError(new Error("failed with env-only-secret"))).not.toContain("env-only-secret");
+  } finally {
+    if (previousPassword === undefined)
+      Reflect.deleteProperty(process.env, "OPENCODE_SERVER_PASSWORD");
+    else process.env.OPENCODE_SERVER_PASSWORD = previousPassword;
+  }
+});
+
+test("V2 log formatting redacts JSON and quoted secret field keys", () => {
+  const json = redactError(
+    new Error(
+      'request failed {"password":"review-synthetic-password","token":"review-synthetic-token"}',
+    ),
+  );
+  expect(json).not.toContain("review-synthetic-password");
+  expect(json).not.toContain("review-synthetic-token");
+  expect(json).toContain("request failed");
+  expect(json).toContain('"password":"[redacted]"');
+  expect(json).toContain('"token":"[redacted]"');
+
+  const single = redactError(new Error("config {'password': 'single-secret'}"));
+  expect(single).not.toContain("single-secret");
+  expect(single).toContain("config {'password': '[redacted]'}");
+});
+
+test("V2 log formatting redacts secrets in error names and keeps the message", () => {
+  const scheme = new Error("plain failure remains visible");
+  scheme.name = "Basic review-name-secret";
+  const formatted = redactError(scheme);
+  expect(formatted).not.toContain("review-name-secret");
+  expect(formatted).toContain("[redacted]");
+  expect(formatted).toContain("plain failure remains visible");
+
+  const field = new Error("second failure remains visible");
+  field.name = "password=name-secret";
+  expect(redactError(field)).not.toContain("name-secret");
 });
