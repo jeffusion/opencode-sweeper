@@ -1,14 +1,20 @@
-import { OpenCode, isSessionNotFoundError } from "@opencode/client";
+import { type OpenCode, isSessionNotFoundError } from "@opencode/client";
 import type { SessionInfo } from "@opencode/client";
-import { Service } from "@opencode/client/service";
 import type { Plugin } from "@opencode/plugin";
 import { hasVerifiedPackagePlugin, runV2AutoUpdate } from "./auto-update-v2.js";
 import { parseOptions } from "./options.js";
 import { type SessionLike, type SweepResult, type SweeperClient, runSweep } from "./sweep.js";
+import { resolveCurrentProcessClient } from "./v2-endpoint.js";
+import { runSweepExclusive, sweepQueueID } from "./v2-sweep-queue.js";
 
 type SetupContext = Plugin.Context;
 type AutoUpdateRunner = typeof runV2AutoUpdate;
-type SetupV2Options = { runAutoUpdate?: AutoUpdateRunner; retryDelayMs?: number };
+type MakeClient = (signal: AbortSignal) => Promise<ReturnType<typeof OpenCode.make>>;
+type SetupV2Options = {
+  runAutoUpdate?: AutoUpdateRunner;
+  retryDelayMs?: number;
+  makeClient?: MakeClient;
+};
 const ABORTED_AUTO_UPDATE = Symbol("aborted auto-update");
 
 function awaitAbortable<T>(
@@ -43,8 +49,32 @@ function awaitAbortable<T>(
 const COMMAND_TEMPLATE =
   "Run the `sweep` tool now and report its result back to the user verbatim. Do not summarize or omit counts.";
 
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+const AUTH_VALUE = /\b(Basic|Bearer)\s+[A-Za-z0-9._~+/=-]+/gi;
+const SECRET_FIELD =
+  /(["']?)\b(authorization|password|token|secret)\b\1(\s*[:=]\s*)((?:"[^"]*"|'[^']*'|[^\s,;}\]]+))/gi;
+
+function redactField(
+  _match: string,
+  keyQuote: string,
+  key: string,
+  separator: string,
+  value: string,
+): string {
+  const valueQuote = value.startsWith('"') ? '"' : value.startsWith("'") ? "'" : "";
+  return `${keyQuote}${key}${keyQuote}${separator}${valueQuote}[redacted]${valueQuote}`;
+}
+
+function redactSecrets(value: string): string {
+  const redacted = value.replace(AUTH_VALUE, "$1 [redacted]").replace(SECRET_FIELD, redactField);
+  const password = process.env.OPENCODE_SERVER_PASSWORD;
+  return password ? redacted.split(password).join("[redacted]") : redacted;
+}
+
+/** Format an error for logs without authorization headers or other secret fields. */
+export function redactError(error: unknown): string {
+  const name = error instanceof Error ? redactSecrets(error.name) : "Error";
+  const message = error instanceof Error ? error.message : "unexpected error";
+  return `${name}: ${redactSecrets(message)}`;
 }
 
 function isSessionMissing(error: unknown, id: string): boolean {
@@ -235,24 +265,8 @@ function isExpired(
   return ageMs >= opts.recentActivityGraceMs && ageMs >= threshold;
 }
 
-async function makeClient(signal: AbortSignal): Promise<ReturnType<typeof OpenCode.make>> {
-  assertNotAborted(signal);
-  const endpoint = await Service.discover();
-  assertNotAborted(signal);
-  if (!endpoint)
-    throw new Error("Cannot verify the current OpenCode service; refusing to sweep sessions.");
-  const client = OpenCode.make({
-    baseUrl: endpoint.url,
-    headers: Service.headers(endpoint),
-  });
-  const info = await client.server.info({ signal });
-  assertNotAborted(signal);
-  if (info.pid !== process.pid) {
-    throw new Error(
-      `OpenCode service PID ${info.pid} does not match plugin PID ${process.pid}; refusing to sweep sessions.`,
-    );
-  }
-  return client;
+async function resolveClient(signal: AbortSignal): Promise<ReturnType<typeof OpenCode.make>> {
+  return resolveCurrentProcessClient({ signal });
 }
 
 export async function sweepWithClient(
@@ -329,8 +343,16 @@ async function sweepSafely(
   opts: ReturnType<typeof parseOptions>,
   protectedIDs: Set<string>,
   signal: AbortSignal,
+  makeClient: MakeClient,
 ) {
-  return sweepWithClient(await makeClient(signal), directory, opts, protectedIDs, signal);
+  return runSweepExclusive(async () => {
+    const client = await makeClient(signal);
+    return sweepWithClient(client, directory, opts, protectedIDs, signal);
+  }, signal);
+}
+
+function formatSweepLogSummary(r: Awaited<ReturnType<typeof sweepWithClient>>): string {
+  return `scanned=${r.scanned} deleted=${r.deleted} protected=${r.protectedCount} errors=${r.errors.length}`;
 }
 
 function formatSweepSummary(r: Awaited<ReturnType<typeof sweepWithClient>>): string {
@@ -356,7 +378,7 @@ function formatSweepSummary(r: Awaited<ReturnType<typeof sweepWithClient>>): str
   }
   if (r.errors.length > 0) {
     lines.push("errors:");
-    for (const error of r.errors) lines.push(`  ${error.id}: ${error.error}`);
+    for (const error of r.errors) lines.push(`  ${error.id}: ${redactSecrets(error.error)}`);
   }
   return lines.join("\n");
 }
@@ -369,8 +391,9 @@ export async function setupV2(
   const directory = ctx.location.directory;
   const protectedIDs = new Set(opts.protect);
   const lifecycle = new AbortController();
+  const makeClient = dependencies.makeClient ?? resolveClient;
   const sweepInvoker = createSweepInvoker(
-    (signal) => sweepSafely(directory, opts, protectedIDs, signal),
+    (signal) => sweepSafely(directory, opts, protectedIDs, signal, makeClient),
     lifecycle.signal,
   );
   const invoke = (id?: string, invocationSignal?: AbortSignal): Promise<SweepResult> => {
@@ -389,7 +412,7 @@ export async function setupV2(
           const result = await invoke(context.sessionID, context.signal);
           return { content: formatSweepSummary(result) };
         } catch (error) {
-          return { content: `Sweep failed: ${errorMessage(error)}` };
+          return { content: `Sweep failed: ${redactError(error)}` };
         }
       },
     });
@@ -498,14 +521,26 @@ export async function setupV2(
   if (opts.intervalMs > 0) {
     timer = setInterval(() => {
       void invoke()
-        .then((result) => console.info("opencode-sweeper timer sweep", formatSweepSummary(result)))
+        .then((result) =>
+          console.info("opencode-sweeper timer sweep", formatSweepLogSummary(result)),
+        )
         .catch((error) => {
-          if (!lifecycle.signal.aborted) console.error("opencode-sweeper timer error", error);
+          if (!lifecycle.signal.aborted)
+            console.error("opencode-sweeper timer error", redactError(error));
         });
     }, opts.intervalMs);
     if (typeof timer === "object" && "unref" in timer) timer.unref();
   }
-  console.info("opencode-sweeper V2 loaded", { ...opts, dbPath: undefined });
+  console.info("opencode-sweeper V2 loaded", {
+    directory,
+    sweepQueueID,
+    expiryMs: opts.expiryMs,
+    subagentExpiryMs: opts.subagentExpiryMs,
+    intervalMs: opts.intervalMs,
+    dryRun: opts.dryRun,
+    protectCount: opts.protect.length,
+    recentActivityGraceMs: opts.recentActivityGraceMs,
+  });
   return async () => {
     lifecycle.abort(new Error("opencode-sweeper plugin unloaded"));
     if (autoUpdateTimer) clearTimeout(autoUpdateTimer);
