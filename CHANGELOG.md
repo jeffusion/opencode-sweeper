@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/jeffusion/opencode-sweeper/compare/v0.3.0...v0.3.1) (2026-10-23)
+
+
+### Bug Fixes
+
+* **v2:** verify host, serialize sweeps, and redact logs ([051254f](https://github.com/jeffusion/opencode-sweeper/commit/051254ffd4a04b2887a228c577f8c09208577cad))
+
 ## [0.3.0](https://github.com/jeffusion/opencode-sweeper/compare/v0.2.0...v0.3.0) (2026-09-24)
 
 
