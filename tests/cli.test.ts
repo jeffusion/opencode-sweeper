@@ -16,6 +16,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { run } from "../src/cli.js";
+import type { CodexRpcClient } from "../src/codex-rpc.js";
 import { LOCK_NAME, parseConfig } from "../src/config-file.js";
 
 const require = createRequire(import.meta.url);
@@ -440,5 +441,128 @@ describe("sweeper install CLI", () => {
     } finally {
       await chmod(path, 0o644);
     }
+  });
+});
+
+async function codexClient() {
+  const home = await tempRoot();
+  const id = "0190a000-0000-7000-8000-000000000001";
+  const directory = join(home, "sessions");
+  await mkdir(directory);
+  const path = join(directory, `rollout-2025-04-10T12-34-56-${id}.jsonl`);
+  await writeFile(path, "");
+  const deleteRequests: string[] = [];
+  const client: CodexRpcClient = {
+    version: "0.163.0",
+    codexHome: home,
+    async request(method, params = {}) {
+      if (method === "thread/loaded/list") return { data: [], nextCursor: null };
+      if (method === "thread/list") {
+        return { data: params.archived || deleteRequests.length ? [] : [{ id }], nextCursor: null };
+      }
+      if (method === "thread/read") {
+        return {
+          thread: {
+            id,
+            path,
+            updatedAt: 1_700_000_000,
+            parentThreadId: null,
+            forkedFromId: null,
+            status: { type: "notLoaded" },
+          },
+        };
+      }
+      if (method === "thread/delete") {
+        deleteRequests.push(String(params.threadId));
+        await rm(path);
+        return {};
+      }
+      throw new Error(`unexpected method: ${method}`);
+    },
+    async close() {},
+  };
+  return { client, id, deleteRequests };
+}
+
+async function invokeCodex(
+  args: string[],
+  factory?: (env: NodeJS.ProcessEnv) => Promise<CodexRpcClient>,
+) {
+  const output = streams();
+  const code = await run({
+    args,
+    env: { ...process.env },
+    ...output,
+    ...(factory === undefined ? {} : { codexClientFactory: factory }),
+  });
+  return { code, ...output.text() };
+}
+
+describe("codex CLI", () => {
+  it("prints codex usage and version", async () => {
+    const help = await invokeCodex(["codex", "--help"]);
+    const current = await invokeCodex(["codex", "--version"]);
+
+    expect(help.code).toBe(0);
+    expect(help.stdout).toContain("Usage: opencode-sweeper codex");
+    expect(current.code).toBe(0);
+    expect(current.stdout.trim()).toMatch(/^\d+\.\d+\.\d+$/);
+  });
+
+  it("rejects unknown flags, positionals and invalid durations", async () => {
+    let factoryCalls = 0;
+    const factory = async (): Promise<CodexRpcClient> => {
+      factoryCalls += 1;
+      throw new Error("factory must not run");
+    };
+    const unknown = await invokeCodex(["codex", "--json"], factory);
+    const positional = await invokeCodex(["codex", "extra"], factory);
+    const duration = await invokeCodex(["codex", "--expiry", "not-a-duration"], factory);
+
+    expect(unknown.code).toBe(1);
+    expect(unknown.stderr).toContain("Usage: opencode-sweeper codex");
+    expect(positional.code).toBe(1);
+    expect(positional.stderr).toContain("Usage: opencode-sweeper codex");
+    expect(duration.code).toBe(1);
+    expect(duration.stderr).toContain("invalid duration");
+    expect(factoryCalls).toBe(0);
+  });
+
+  for (const apply of [false, true]) {
+    it(apply ? "routes --apply to deletion" : "routes codex to preview by default", async () => {
+      const { client, id, deleteRequests } = await codexClient();
+      const result = await invokeCodex(
+        apply ? ["codex", "--apply"] : ["codex"],
+        async () => client,
+      );
+      expect(result.code).toBe(0);
+      expect(result.stderr).toBe("");
+      expect(deleteRequests).toEqual(apply ? [id] : []);
+      expect(result.stdout).toContain(`${apply ? "[DELETED]" : "[DRY-RUN]"} ${id}`);
+    });
+  }
+
+  it("returns non-zero when the Codex client cannot start", async () => {
+    const result = await invokeCodex(["codex"], async () => {
+      throw new Error("unavailable");
+    });
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain("unavailable");
+  });
+
+  it("returns non-zero for a completed sweep with errors", async () => {
+    const { client } = await codexClient();
+    const request = client.request.bind(client);
+    client.request = async (method, params) => {
+      if (method === "thread/read") {
+        const response = (await request(method, params)) as { thread: { status: unknown } };
+        response.thread.status = { type: "systemError" };
+        return response;
+      }
+      return request(method, params);
+    };
+    const result = await invokeCodex(["codex"], async () => client);
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain("systemError");
   });
 });

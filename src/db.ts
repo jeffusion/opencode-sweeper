@@ -115,6 +115,7 @@ export function rowToSessionLike(row: SessionRow): SessionLike {
     parentID: row.parent_id === null ? undefined : row.parent_id,
     title: row.title,
     directory: row.directory,
+    ...(row.time_archived === null ? {} : { archived: true }),
     time: {
       created: row.time_created,
       updated: row.time_updated,

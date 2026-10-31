@@ -2,7 +2,15 @@ import { expect, mock, test } from "bun:test";
 import { resolve } from "node:path";
 import { resolve as resolveHost } from "@opencode/plugin/host";
 import { parseOptions } from "../src/options.js";
-import { createSweepInvoker, listAll, redactError, setupV2, sweepWithClient } from "../src/v2.js";
+import {
+  createSweepInvoker,
+  formatSweepSummary,
+  listAll,
+  listBothGroups,
+  redactError,
+  setupV2,
+  sweepWithClient,
+} from "../src/v2.js";
 
 type TestTool = {
   name: string;
@@ -23,6 +31,28 @@ type TestClient = Parameters<typeof listAll>[0];
 
 function asClient(value: unknown): TestClient {
   return value as TestClient;
+}
+
+const HOST_VERSION = "2.1.3";
+
+function serverInfo(version = HOST_VERSION) {
+  return { version, pid: 1, urls: [], paths: { tmp: "/tmp" } };
+}
+
+/** Minimal client surface: every sweep checks the real host version before scanning. */
+function withHost<T extends Record<string, unknown>>(client: T, version = HOST_VERSION): T {
+  return {
+    ...client,
+    server: { info: mock(async () => serverInfo(version)) },
+  };
+}
+
+/** Serve normal sessions by default and an explicit archived set for archived=true requests. */
+function groupedList(normal: unknown[], archived: unknown[] = []) {
+  return mock(async (input?: { archived?: boolean; cursor?: string }) => ({
+    data: input?.archived === true ? archived : normal,
+    cursor: {},
+  }));
 }
 
 function setupContext(list: () => Promise<unknown>, intervalMs = 0) {
@@ -281,10 +311,13 @@ test("local OpenCode host resolution discovers the package server entry", () => 
 test("V2 refuses partial results when pagination repeats a cursor", async () => {
   const client = {
     session: {
-      list: mock(async () => ({ data: [{ id: "one" }], cursor: { next: "same" } })),
+      list: mock(async () => ({
+        data: [{ id: "one", title: "one", time: { created: 1, updated: 2 } }],
+        cursor: { next: "same" },
+      })),
     },
   };
-  await expect(listAll(asClient(client))).rejects.toThrow("repeated cursor");
+  await expect(listAll(asClient(client), false)).rejects.toThrow("repeated cursor");
   expect(client.session.list).toHaveBeenCalledTimes(2);
 });
 
@@ -293,7 +326,7 @@ test("V2 reads every page and deduplicates identical session records", async () 
   const list = mock(async ({ cursor }: { cursor?: string }) =>
     cursor ? { data: [record], cursor: {} } : { data: [record], cursor: { next: "page-2" } },
   );
-  const sessions = await listAll(asClient({ session: { list } }));
+  const sessions = await listAll(asClient({ session: { list } }), false);
   expect(list).toHaveBeenCalledTimes(2);
   expect(sessions.map(({ id }) => id)).toEqual(["same"]);
 });
@@ -304,10 +337,91 @@ test("V2 rejects conflicting records for the same ID after paging", async () => 
   const list = mock(async ({ cursor }: { cursor?: string }) =>
     cursor ? { data: [conflicting], cursor: {} } : { data: [first], cursor: { next: "page-2" } },
   );
-  await expect(listAll(asClient({ session: { list } }))).rejects.toThrow(
+  await expect(listAll(asClient({ session: { list } }), false)).rejects.toThrow(
     "conflicting records for session same; refusing to sweep",
   );
   expect(list).toHaveBeenCalledTimes(2);
+});
+
+test("V2 requests each archived group explicitly and reads every page", async () => {
+  const archivedRecord = {
+    id: "archived",
+    title: "archived",
+    time: { created: 1, updated: 2, archived: 3 },
+  };
+  const list = mock(async (input: { archived?: boolean; cursor?: string }) => {
+    if (input.archived === true) {
+      return {
+        data: input.cursor ? [archivedRecord] : [],
+        cursor: input.cursor ? {} : { next: "a-2" },
+      };
+    }
+    return { data: [], cursor: {} };
+  });
+  const sessions = await listAll(asClient({ session: { list } }), true);
+  expect(sessions.map(({ id }) => id)).toEqual(["archived"]);
+  expect(list.mock.calls.map(([input]) => input)).toEqual([
+    { limit: 100, order: "asc", archived: true },
+    { limit: 100, order: "asc", archived: true, cursor: "a-2" },
+  ]);
+});
+
+test("V2 rejects a page whose time.archived contradicts the requested group", async () => {
+  const list = mock(async (input: { archived?: boolean }) => ({
+    data: [
+      input.archived === true
+        ? { id: "missing-archived", title: "x", time: { created: 1, updated: 2 } }
+        : {
+            id: "unexpected-archived",
+            title: "x",
+            time: { created: 1, updated: 2, archived: 3 },
+          },
+    ],
+    cursor: {},
+  }));
+  await expect(listAll(asClient({ session: { list } }), true)).rejects.toThrow(
+    "inconsistent time.archived",
+  );
+  await expect(listAll(asClient({ session: { list } }), false)).rejects.toThrow(
+    "inconsistent time.archived",
+  );
+});
+
+test("V2 fails closed when an ID appears in both groups", async () => {
+  const archivedRecord = {
+    id: "same",
+    title: "same",
+    time: { created: 1, updated: 2, archived: 3 },
+  };
+  const list = groupedList(
+    [{ id: "same", title: "same", time: { created: 1, updated: 2 } }],
+    [archivedRecord],
+  );
+  await expect(listBothGroups(asClient({ session: { list } }))).rejects.toThrow(
+    "appeared in both archived and normal lists",
+  );
+});
+
+test("V2 aborts an archived scan when a later page fails", async () => {
+  const list = mock(async (input: { archived?: boolean; cursor?: string }) => {
+    if (input.archived === true) {
+      if (input.cursor) throw new Error("archived list unavailable");
+      return {
+        data: [
+          {
+            id: "archived",
+            title: "archived",
+            time: { created: 1, updated: 2, archived: 3 },
+          },
+        ],
+        cursor: { next: "a-2" },
+      };
+    }
+    return { data: [], cursor: {} };
+  });
+  await expect(listAll(asClient({ session: { list } }), true)).rejects.toThrow(
+    "archived list unavailable",
+  );
 });
 
 test("V2 protects active and explicitly protected sessions", async () => {
@@ -318,13 +432,13 @@ test("V2 protects active and explicitly protected sessions", async () => {
     time: { created: old, updated: old },
   }));
   const remove = mock(async () => undefined);
-  const client = {
+  const client = withHost({
     session: {
-      list: mock(async () => ({ data: sessions, cursor: {} })),
+      list: groupedList(sessions),
       active: mock(async () => ({ active: { id: "active" } })),
       remove,
     },
-  };
+  });
   const result = await sweepWithClient(
     asClient(client),
     "/project",
@@ -352,10 +466,11 @@ test("V2 rechecks descendant activity, protection and tree changes before cascad
   const protectedIDs = new Set<string>();
   const active = mock(async () => ({}));
   const remove = mock(async () => undefined);
-  let listCalls = 0;
-  const list = mock(async () => {
-    listCalls += 1;
-    if (listCalls === 2) {
+  let normalCalls = 0;
+  const list = mock(async (input?: { archived?: boolean }) => {
+    if (input?.archived === true) return { data: [], cursor: {} };
+    normalCalls += 1;
+    if (normalCalls === 2) {
       // Simulate a session becoming dynamically protected between classification
       // and the delete check. Its current parent must be protected too.
       protectedIDs.add("child");
@@ -363,7 +478,7 @@ test("V2 rechecks descendant activity, protection and tree changes before cascad
     return { data: [root, child], cursor: {} };
   });
   const result = await sweepWithClient(
-    asClient({ session: { list, active, remove } }),
+    asClient(withHost({ session: { list, active, remove } })),
     "/project",
     parseOptions({
       expiryMs: 1,
@@ -393,9 +508,11 @@ test("V2 propagates a newly active descendant to its ancestor before removal", a
   });
   const remove = mock(async () => undefined);
   const result = await sweepWithClient(
-    asClient({
-      session: { list: mock(async () => ({ data: [root, child], cursor: {} })), active, remove },
-    }),
+    asClient(
+      withHost({
+        session: { list: groupedList([root, child]), active, remove },
+      }),
+    ),
     "/project",
     parseOptions({
       expiryMs: 1,
@@ -428,13 +545,14 @@ test("V2 blocks a cascade when a descendant becomes recent or a new child appear
   const remove = mock(async ({ sessionID }: { sessionID: string }) => {
     removedIDs.push(sessionID);
   });
-  let listCalls = 0;
-  const list = mock(async () => {
-    listCalls += 1;
-    return { data: listCalls === 1 ? [root, child] : [root, child, newChild], cursor: {} };
+  let normalCalls = 0;
+  const list = mock(async (input?: { archived?: boolean }) => {
+    if (input?.archived === true) return { data: [], cursor: {} };
+    normalCalls += 1;
+    return { data: normalCalls === 1 ? [root, child] : [root, child, newChild], cursor: {} };
   });
   const result = await sweepWithClient(
-    asClient({ session: { list, active: mock(async () => ({})), remove } }),
+    asClient(withHost({ session: { list, active: mock(async () => ({})), remove } })),
     "/project",
     parseOptions({
       expiryMs: 1,
@@ -465,16 +583,22 @@ test("V2 blocks deletion when an initially listed descendant disappears or chang
       { id: "other-root", title: "other", time: { created: old, updated: old } },
     ],
   ]) {
-    let listCalls = 0;
+    let normalCalls = 0;
     const remove = mock(async () => undefined);
     const result = await sweepWithClient(
-      asClient({
-        session: {
-          list: mock(async () => ({ data: ++listCalls === 1 ? [root, child] : fresh, cursor: {} })),
-          active: mock(async () => ({})),
-          remove,
-        },
-      }),
+      asClient(
+        withHost({
+          session: {
+            list: mock(async (input?: { archived?: boolean }) => {
+              if (input?.archived === true) return { data: [], cursor: {} };
+              normalCalls += 1;
+              return { data: normalCalls === 1 ? [root, child] : fresh, cursor: {} };
+            }),
+            active: mock(async () => ({})),
+            remove,
+          },
+        }),
+      ),
       "/project",
       parseOptions({
         expiryMs: 1,
@@ -504,13 +628,15 @@ test("V2 never treats a child SessionNotFoundError as the parent cascade succeed
     }
   });
   const result = await sweepWithClient(
-    asClient({
-      session: {
-        list: mock(async () => ({ data: [root, child], cursor: {} })),
-        active: mock(async () => ({})),
-        remove,
-      },
-    }),
+    asClient(
+      withHost({
+        session: {
+          list: groupedList([root, child]),
+          active: mock(async () => ({})),
+          remove,
+        },
+      }),
+    ),
     "/project",
     parseOptions({
       expiryMs: 1,
@@ -529,15 +655,16 @@ test("V2 stops issuing DELETEs after its cancellation signal aborts", async () =
   const old = Date.now() - 10 * 24 * 60 * 60 * 1000;
   const root = { id: "root", title: "root", time: { created: old, updated: old } };
   const controller = new AbortController();
-  let listCalls = 0;
+  let normalCalls = 0;
   const remove = mock(async () => undefined);
-  const list = mock(async () => {
-    listCalls += 1;
-    if (listCalls === 2) controller.abort(new Error("test abort"));
+  const list = mock(async (input?: { archived?: boolean }) => {
+    if (input?.archived === true) return { data: [], cursor: {} };
+    normalCalls += 1;
+    if (normalCalls === 2) controller.abort(new Error("test abort"));
     return { data: [root], cursor: {} };
   });
   const result = await sweepWithClient(
-    asClient({ session: { list, active: mock(async () => ({})), remove } }),
+    asClient(withHost({ session: { list, active: mock(async () => ({})), remove } })),
     "/project",
     parseOptions({ expiryMs: 1, recentActivityGraceMs: 60 * 60 * 1000, dryRun: false }),
     new Set(),
@@ -545,6 +672,136 @@ test("V2 stops issuing DELETEs after its cancellation signal aborts", async () =
   );
   expect(remove).not.toHaveBeenCalled();
   expect(result.errors.some((error) => error.id === "root")).toBe(true);
+});
+
+test("V2 zero-deletes on unverified or future host versions", async () => {
+  const old = Date.now() - 10 * 24 * 60 * 60 * 1000;
+  const root = { id: "root", title: "root", time: { created: old, updated: old } };
+  for (const version of ["2.0.15", "2.1.4", "", "unknown"]) {
+    const list = groupedList([root]);
+    const remove = mock(async () => undefined);
+    await expect(
+      sweepWithClient(
+        asClient(withHost({ session: { list, active: mock(async () => ({})), remove } }, version)),
+        "/project",
+        parseOptions({
+          expiryMs: 1,
+          subagentExpiryMs: 1,
+          recentActivityGraceMs: 60 * 60 * 1000,
+          dryRun: false,
+        }),
+        new Set(),
+      ),
+    ).rejects.toThrow("is not supported for archived session enumeration");
+    expect(list).not.toHaveBeenCalled();
+    expect(remove).not.toHaveBeenCalled();
+  }
+});
+
+test("V2 scans both groups and reports an archived cascade child", async () => {
+  const old = Date.now() - 10 * 24 * 60 * 60 * 1000;
+  const root = { id: "root", title: "root", time: { created: old, updated: old } };
+  const archivedChild = {
+    id: "archived-child",
+    parentID: "root",
+    title: "archived-child",
+    time: { created: old, updated: old, archived: old + 1 },
+  };
+  const remove = mock(async () => undefined);
+  const result = await sweepWithClient(
+    asClient(
+      withHost({
+        session: {
+          list: groupedList([root], [archivedChild]),
+          active: mock(async () => ({})),
+          remove,
+        },
+      }),
+    ),
+    "/project",
+    parseOptions({
+      expiryMs: 1,
+      subagentExpiryMs: 1,
+      recentActivityGraceMs: 60 * 60 * 1000,
+      dryRun: false,
+    }),
+    new Set(),
+  );
+  expect(result.scanned).toBe(2);
+  expect(result.archivedScanned).toBe(1);
+  expect(result.deleted).toBe(2);
+  expect(result.deletions).toEqual([
+    { id: "root", title: "root", dryRun: false },
+    {
+      id: "archived-child",
+      title: "archived-child",
+      parentID: "root",
+      dryRun: false,
+      archived: true,
+    },
+  ]);
+  const summary = formatSweepSummary(result);
+  expect(summary).toContain("archived scanned: 1");
+  expect(summary).toContain("[archived] archived-child");
+});
+
+test("V2 stops later deletions when the pre-delete recheck conflicts", async () => {
+  const old = Date.now() - 10 * 24 * 60 * 60 * 1000;
+  const first = { id: "first", title: "first", time: { created: old, updated: old } };
+  const second = { id: "second", title: "second", time: { created: old, updated: old } };
+  const remove = mock(async () => undefined);
+  let normalCalls = 0;
+  const list = mock(async (input?: { archived?: boolean }) => {
+    normalCalls += 1;
+    if (input?.archived === true) {
+      return normalCalls >= 4
+        ? {
+            data: [{ ...first, time: { ...first.time, archived: old } }],
+            cursor: {},
+          }
+        : { data: [], cursor: {} };
+    }
+    return { data: [first, second], cursor: {} };
+  });
+  const result = await sweepWithClient(
+    asClient(withHost({ session: { list, active: mock(async () => ({})), remove } })),
+    "/project",
+    parseOptions({
+      expiryMs: 1,
+      subagentExpiryMs: 1,
+      recentActivityGraceMs: 60 * 60 * 1000,
+      dryRun: false,
+    }),
+    new Set(),
+  );
+  expect(remove).not.toHaveBeenCalled();
+  expect(result.errors).toHaveLength(1);
+  expect(result.errors[0]?.id).toBe("first");
+  expect(result.errors[0]?.error).toContain("appeared in both archived and normal lists");
+});
+
+test("V2 leaves zero deleted when the initial archived scan fails", async () => {
+  const old = Date.now() - 10 * 24 * 60 * 60 * 1000;
+  const root = { id: "root", title: "root", time: { created: old, updated: old } };
+  const remove = mock(async () => undefined);
+  const list = mock(async (input?: { archived?: boolean }) => {
+    if (input?.archived === true) throw new Error("archived list unavailable");
+    return { data: [root], cursor: {} };
+  });
+  await expect(
+    sweepWithClient(
+      asClient(withHost({ session: { list, active: mock(async () => ({})), remove } })),
+      "/project",
+      parseOptions({
+        expiryMs: 1,
+        subagentExpiryMs: 1,
+        recentActivityGraceMs: 60 * 60 * 1000,
+        dryRun: false,
+      }),
+      new Set(),
+    ),
+  ).rejects.toThrow("archived list unavailable");
+  expect(remove).not.toHaveBeenCalled();
 });
 
 test("a tool signal cancels a sweep already started by the timer", async () => {

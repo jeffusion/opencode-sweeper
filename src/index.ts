@@ -13,10 +13,11 @@ const COMMAND_TEMPLATE =
   "Run the `sweep` tool now and report its result back to the user verbatim. Do not summarize or omit counts.";
 const COMMAND_DESCRIPTION = "Sweep expired sessions and subagents now (runs the sweep tool).";
 
-function formatSweepSummary(r: SweepResult): string {
+export function formatSweepSummary(r: SweepResult): string {
   const lines = [
     "Sweep complete.",
     `scanned: ${r.scanned}`,
+    `archived scanned: ${r.archivedScanned}`,
     `deleted: ${r.deleted}`,
     `protected: ${r.protectedCount}`,
     `recentActive skipped: ${r.recentActiveSkipped}`,
@@ -30,8 +31,9 @@ function formatSweepSummary(r: SweepResult): string {
     lines.push("deletions:");
     for (const d of r.deletions) {
       const tag = d.dryRun ? "DRY-RUN" : "DELETED";
+      const archived = d.archived === true ? " [archived]" : "";
       const parent = d.parentID === undefined ? "" : ` (parent: ${d.parentID})`;
-      lines.push(`  [${tag}] ${d.id} — ${d.title}${parent}`);
+      lines.push(`  [${tag}]${archived} ${d.id} — ${d.title}${parent}`);
     }
   }
   if (r.errors.length > 0) {

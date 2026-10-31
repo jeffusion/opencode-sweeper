@@ -201,12 +201,16 @@ test("rowToSessionLike converts parent_id null → undefined, non-null → strin
     time_archived: null,
   };
   const subRow = { ...mainRow, id: "ses_y", parent_id: "ses_x" };
+  const archivedRow = { ...mainRow, id: "ses_z", time_archived: 1234 };
 
   const main: SessionLike = rowToSessionLike(mainRow);
   const sub: SessionLike = rowToSessionLike(subRow);
+  const archived: SessionLike = rowToSessionLike(archivedRow);
 
   assert.equal(main.parentID, undefined);
   assert.equal(sub.parentID, "ses_x");
+  assert.equal(main.archived, undefined);
+  assert.equal(archived.archived, true);
 });
 
 test("SchemaMismatchError fires when required column is missing", async () => {

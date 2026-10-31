@@ -5,6 +5,8 @@ import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
+import type { CodexRpcClient } from "./codex-rpc.js";
+import { formatCodexResult, runCodexSweep } from "./codex.js";
 import {
   CONFIG_FILES,
   compareVersions,
@@ -18,6 +20,8 @@ import {
   writeExisting,
   writeNew,
 } from "./config-file.js";
+import { parseOptions } from "./options.js";
+import { redactSecrets } from "./redact.js";
 
 const require = createRequire(import.meta.url);
 const { name: PACKAGE_NAME, version: PACKAGE_VERSION } = require("../package.json") as {
@@ -29,6 +33,12 @@ const USAGE = `Usage: opencode-sweeper install [--format v1|v2]
 
 Register this package in your global OpenCode config.
 New configs default to v1 (plugin array) for compatibility; use --format v2 for the plugins array.`;
+const CODEX_USAGE = `Usage: opencode-sweeper codex [--apply] [--expiry <duration>]
+                          [--subagent-expiry <duration>]
+                          [--recent-activity-grace <duration>] [--protect <id>]...
+
+Preview expired Codex CLI sessions (archived and active) and optionally delete them.
+Without --apply nothing is deleted. Requires Codex CLI 0.163.0.`;
 
 type Output = { write(text: string): unknown };
 type RunOptions = {
@@ -36,6 +46,7 @@ type RunOptions = {
   env?: NodeJS.ProcessEnv;
   stdout?: Output;
   stderr?: Output;
+  codexClientFactory?: (env: NodeJS.ProcessEnv) => Promise<CodexRpcClient>;
 };
 type ConfigRecord = Record<string, unknown>;
 type ConfigFile = {
@@ -321,10 +332,126 @@ function formatOf(
   return { exitCode: 0, install: true, format: requested };
 }
 
+const CODEX_OPTION_NAMES = new Set([
+  "help",
+  "h",
+  "version",
+  "v",
+  "apply",
+  "expiry",
+  "subagent-expiry",
+  "subagentExpiry",
+  "recent-activity-grace",
+  "recentActivityGrace",
+  "protect",
+]);
+
+// parseArgs camelCases hyphenated long option names in `values`; read both
+// spellings so the accepted flag and the lookup cannot drift apart.
+function optionValue(values: Record<string, unknown>, name: string): unknown {
+  const camel = name.replace(/-([a-z])/g, (_match, letter: string) => letter.toUpperCase());
+  return values[name] ?? values[camel];
+}
+
+async function runCodex(
+  args: string[],
+  options: RunOptions,
+  stdout: Output,
+  stderr: Output,
+): Promise<number> {
+  let parsed: ReturnType<typeof parseArgs>;
+  try {
+    parsed = parseArgs({
+      args,
+      options: {
+        help: { type: "boolean", short: "h" },
+        version: { type: "boolean", short: "v" },
+        apply: { type: "boolean" },
+        expiry: { type: "string" },
+        "subagent-expiry": { type: "string" },
+        "recent-activity-grace": { type: "string" },
+        protect: { type: "string", multiple: true },
+      },
+      allowPositionals: true,
+      strict: false,
+      tokens: true,
+    });
+  } catch {
+    stderr.write(`${CODEX_USAGE}\n`);
+    return 1;
+  }
+  const values = parsed.values as Record<string, unknown>;
+
+  if (
+    (parsed.tokens ?? []).some(
+      (token) => token.kind === "option" && !CODEX_OPTION_NAMES.has(token.name),
+    ) ||
+    parsed.positionals.length > 0
+  ) {
+    stderr.write(`${CODEX_USAGE}\n`);
+    return 1;
+  }
+  if (values.help === true) {
+    stdout.write(`${CODEX_USAGE}\n`);
+    return 0;
+  }
+  if (values.version === true) {
+    stdout.write(`${PACKAGE_VERSION}\n`);
+    return 0;
+  }
+
+  let opts: ReturnType<typeof parseOptions>;
+  try {
+    const protect = values.protect;
+    const raw: Record<string, unknown> = {
+      dryRun: values.apply !== true,
+      protect: protect === undefined ? [] : Array.isArray(protect) ? protect : [protect],
+    };
+    const expiry = values.expiry;
+    const subagentExpiry = optionValue(values, "subagent-expiry");
+    const recentActivityGrace = optionValue(values, "recent-activity-grace");
+    if (expiry !== undefined) raw.expiry = expiry;
+    if (subagentExpiry !== undefined) raw.subagentExpiry = subagentExpiry;
+    if (recentActivityGrace !== undefined) raw.recentActivityGrace = recentActivityGrace;
+    opts = parseOptions(raw);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Invalid options.";
+    stderr.write(`Codex 参数无效: ${message}\n`);
+    return 1;
+  }
+
+  try {
+    const result = await runCodexSweep({
+      expiryMs: opts.expiryMs,
+      subagentExpiryMs: opts.subagentExpiryMs,
+      recentActivityGraceMs: opts.recentActivityGraceMs,
+      dryRun: opts.dryRun,
+      protect: opts.protect,
+      env: options.env,
+      createClient: options.codexClientFactory,
+    });
+    stdout.write(`${formatCodexResult(result)}\n`);
+    if (result.errors.length > 0) {
+      for (const failure of result.errors) {
+        stderr.write(`${failure.id}: ${redactSecrets(failure.error)}\n`);
+      }
+    }
+    return result.errors.length > 0 ? 1 : 0;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    stderr.write(`Codex 清理失败: ${redactSecrets(message)}\n`);
+    return 1;
+  }
+}
+
 export async function run(options: RunOptions = {}): Promise<number> {
   const stdout = options.stdout ?? process.stdout;
   const stderr = options.stderr ?? process.stderr;
-  const parsed = formatOf(options.args ?? process.argv.slice(2), stdout, stderr);
+  const args = options.args ?? process.argv.slice(2);
+  if (args[0] === "codex") {
+    return runCodex(args.slice(1), options, stdout, stderr);
+  }
+  const parsed = formatOf(args, stdout, stderr);
   if (parsed.exitCode !== 0 || !parsed.install) return parsed.exitCode;
 
   try {

@@ -9,6 +9,7 @@ export type SessionSeed = {
   readonly directory: string;
   readonly parentID?: string;
   readonly compacting?: number;
+  readonly archived?: boolean;
 };
 
 export type DeleteBehavior =
@@ -33,6 +34,10 @@ export function makeSession(seed: SessionSeed): SessionLike {
 
   if (seed.compacting !== undefined) {
     session.time.compacting = seed.compacting;
+  }
+
+  if (seed.archived === true) {
+    session.archived = true;
   }
 
   return session;

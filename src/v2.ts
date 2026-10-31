@@ -3,9 +3,18 @@ import type { SessionInfo } from "@opencode/client";
 import type { Plugin } from "@opencode/plugin";
 import { hasVerifiedPackagePlugin, runV2AutoUpdate } from "./auto-update-v2.js";
 import { parseOptions } from "./options.js";
-import { type SessionLike, type SweepResult, type SweeperClient, runSweep } from "./sweep.js";
+import { redactSecrets } from "./redact.js";
+import {
+  type SessionLike,
+  SweepAbortError,
+  type SweepResult,
+  type SweeperClient,
+  runSweep,
+} from "./sweep.js";
 import { resolveCurrentProcessClient } from "./v2-endpoint.js";
 import { runSweepExclusive, sweepQueueID } from "./v2-sweep-queue.js";
+
+export { redactSecrets };
 
 type SetupContext = Plugin.Context;
 type AutoUpdateRunner = typeof runV2AutoUpdate;
@@ -49,25 +58,16 @@ function awaitAbortable<T>(
 const COMMAND_TEMPLATE =
   "Run the `sweep` tool now and report its result back to the user verbatim. Do not summarize or omit counts.";
 
-const AUTH_VALUE = /\b(Basic|Bearer)\s+[A-Za-z0-9._~+/=-]+/gi;
-const SECRET_FIELD =
-  /(["']?)\b(authorization|password|token|secret)\b\1(\s*[:=]\s*)((?:"[^"]*"|'[^']*'|[^\s,;}\]]+))/gi;
+// Only a host version whose archived-list semantics were verified in an isolated
+// environment may be swept. 2.1.3 is the audited baseline; a newer version needs the
+// same verification before it is added here. Anything else is diagnose-only (zero deletes).
+const VERIFIED_ARCHIVED_HOST_VERSIONS = new Set(["2.1.3"]);
 
-function redactField(
-  _match: string,
-  keyQuote: string,
-  key: string,
-  separator: string,
-  value: string,
-): string {
-  const valueQuote = value.startsWith('"') ? '"' : value.startsWith("'") ? "'" : "";
-  return `${keyQuote}${key}${keyQuote}${separator}${valueQuote}[redacted]${valueQuote}`;
-}
-
-function redactSecrets(value: string): string {
-  const redacted = value.replace(AUTH_VALUE, "$1 [redacted]").replace(SECRET_FIELD, redactField);
-  const password = process.env.OPENCODE_SERVER_PASSWORD;
-  return password ? redacted.split(password).join("[redacted]") : redacted;
+function assertVerifiedArchivedHost(version: string): void {
+  if (VERIFIED_ARCHIVED_HOST_VERSIONS.has(version)) return;
+  throw new Error(
+    `OpenCode host version ${version === "" ? "unknown" : version} is not supported for archived session enumeration; refusing to sweep.`,
+  );
 }
 
 /** Format an error for logs without authorization headers or other secret fields. */
@@ -154,13 +154,30 @@ function mapSession(info: SessionInfo, directory: string): SessionLike {
     ...(info.parentID === undefined ? {} : { parentID: info.parentID }),
     title: info.title ?? info.id,
     directory,
+    ...(typeof info.time.archived === "number" ? { archived: true } : {}),
     time: { created: info.time.created, updated: info.time.updated },
   };
 }
 
-/** List every page before returning any results, so a paging failure never permits partial deletion. */
+function assertArchivedGroup(archived: boolean, session: SessionInfo): void {
+  const archivedAt: number | null | undefined = session.time.archived;
+  const consistent = archived
+    ? typeof archivedAt === "number"
+    : archivedAt === undefined || archivedAt === null;
+  if (consistent) return;
+  throw new Error(
+    `session.list archived=${archived} returned session ${session.id} with an inconsistent time.archived value; refusing to sweep.`,
+  );
+}
+
+/**
+ * List every page before returning any results, so a paging failure never permits partial
+ * deletion. Each group is also checked against its filter, because an empty list or a
+ * successful request cannot prove the host actually applied `archived`.
+ */
 export async function listAll(
   client: ReturnType<typeof OpenCode.make>,
+  archived: boolean,
   signal?: AbortSignal,
 ): Promise<SessionInfo[]> {
   const sessions: SessionInfo[] = [];
@@ -172,13 +189,15 @@ export async function listAll(
       {
         limit: 100,
         order: "asc",
+        archived,
         ...(cursor ? { cursor } : {}),
       },
       signal ? { signal } : undefined,
     );
+    for (const session of page.data) assertArchivedGroup(archived, session);
     sessions.push(...page.data);
     const next = page.cursor.next ?? undefined;
-    if (page.data.length === 0 || next === undefined) break;
+    if (next === undefined) break;
     if (seenCursors.has(next) || next === cursor) {
       throw new Error(`session.list repeated cursor: ${next}`);
     }
@@ -205,6 +224,25 @@ export async function listAll(
     }
   }
   return [...unique.values()];
+}
+
+/** Read both archived and normal lists in full; any overlap means the filter contract is broken. */
+export async function listBothGroups(
+  client: ReturnType<typeof OpenCode.make>,
+  signal?: AbortSignal,
+): Promise<SessionInfo[]> {
+  const normal = await listAll(client, false, signal);
+  if (signal) assertNotAborted(signal);
+  const archived = await listAll(client, true, signal);
+  const normalIDs = new Set(normal.map((session) => session.id));
+  for (const session of archived) {
+    if (normalIDs.has(session.id)) {
+      throw new Error(
+        `session ${session.id} appeared in both archived and normal lists; refusing to sweep.`,
+      );
+    }
+  }
+  return [...normal, ...archived];
 }
 
 function getActiveIDs(
@@ -276,7 +314,12 @@ export async function sweepWithClient(
   protectedIDs: Set<string>,
   signal: AbortSignal = new AbortController().signal,
 ) {
-  const sessions = await listAll(client, signal);
+  const host = await client.server.info({ signal });
+  assertNotAborted(signal);
+  // Unverified hosts stay diagnose-only: no scan result, no delete. This is stronger than
+  // "request succeeded", which an old host can do by silently ignoring `archived`.
+  assertVerifiedArchivedHost(host.version);
+  const sessions = await listBothGroups(client, signal);
   assertNotAborted(signal);
   const active = getActiveIDs(await client.session.active({ signal }));
   assertNotAborted(signal);
@@ -291,9 +334,12 @@ export async function sweepWithClient(
         // Re-check the exact candidate and active state immediately before removal. API calls
         // are not atomic, so a session may still become active after these checks.
         const [fresh, currentActive] = await Promise.all([
-          listAll(client, signal),
+          listBothGroups(client, signal),
           client.session.active({ signal }),
-        ]);
+        ]).catch((error: unknown) => {
+          // Revalidation cannot prove the tree is still safe: stop later deletes, keep confirmed ones.
+          throw new SweepAbortError(error instanceof Error ? error.message : String(error));
+        });
         assertNotAborted(signal);
         const freshByID = makeSessionMap(fresh);
         const candidate = freshByID.get(id);
@@ -351,14 +397,15 @@ async function sweepSafely(
   }, signal);
 }
 
-function formatSweepLogSummary(r: Awaited<ReturnType<typeof sweepWithClient>>): string {
-  return `scanned=${r.scanned} deleted=${r.deleted} protected=${r.protectedCount} errors=${r.errors.length}`;
+export function formatSweepLogSummary(r: Awaited<ReturnType<typeof sweepWithClient>>): string {
+  return `scanned=${r.scanned} archived=${r.archivedScanned} deleted=${r.deleted} protected=${r.protectedCount} errors=${r.errors.length}`;
 }
 
-function formatSweepSummary(r: Awaited<ReturnType<typeof sweepWithClient>>): string {
+export function formatSweepSummary(r: Awaited<ReturnType<typeof sweepWithClient>>): string {
   const lines = [
     "Sweep complete.",
     `scanned: ${r.scanned}`,
+    `archived scanned: ${r.archivedScanned}`,
     `deleted: ${r.deleted}`,
     `protected: ${r.protectedCount}`,
     `recentActive skipped: ${r.recentActiveSkipped}`,
@@ -372,8 +419,9 @@ function formatSweepSummary(r: Awaited<ReturnType<typeof sweepWithClient>>): str
     lines.push("deletions:");
     for (const deletion of r.deletions) {
       const tag = deletion.dryRun ? "DRY-RUN" : "DELETED";
+      const archived = deletion.archived === true ? " [archived]" : "";
       const parent = deletion.parentID === undefined ? "" : ` (parent: ${deletion.parentID})`;
-      lines.push(`  [${tag}] ${deletion.id} — ${deletion.title}${parent}`);
+      lines.push(`  [${tag}]${archived} ${deletion.id} — ${deletion.title}${parent}`);
     }
   }
   if (r.errors.length > 0) {

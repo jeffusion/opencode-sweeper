@@ -207,6 +207,7 @@ test("existing-file writes detect external modifications and preserve mode", asy
   try {
     const path = join(directory, "config.json");
     await writeFile(path, '{"old":true}', { mode: 0o640 });
+    await chmod(path, 0o640);
     const initial = await snapshot(path);
     expect(initial).not.toBeNull();
     if (initial === null) throw new Error("expected initial snapshot");

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 
+import { formatSweepSummary } from "../src/index";
 import { runSweep } from "../src/sweep";
 import {
   FIXED_NOW,
@@ -30,6 +31,7 @@ describe("runSweep", () => {
 
       expect(result).toEqual({
         scanned: 3,
+        archivedScanned: 0,
         deleted: 3,
         protectedCount: 0,
         recentActiveSkipped: 0,
@@ -169,6 +171,45 @@ describe("runSweep", () => {
         { id: "old-a", title: "old-a", dryRun: false },
         { id: "old-b", title: "old-b", dryRun: false },
       ]);
+    });
+  });
+
+  it("counts archived sessions and marks only archived deletions", async () => {
+    await withMockedNow(FIXED_NOW, async () => {
+      const client = new MockSweeperClient([
+        makeSession({
+          id: "archived-root",
+          ageMs: 8 * 24 * 60 * 60 * 1_000,
+          title: "archived-root",
+          directory: "/archived",
+          archived: true,
+        }),
+        makeSession({
+          id: "normal-root",
+          ageMs: 8 * 24 * 60 * 60 * 1_000,
+          title: "normal-root",
+          directory: "/normal",
+        }),
+      ]);
+
+      const result = await runSweep(
+        client,
+        defaultSweeperOpts({
+          expiryMs: 7 * 24 * 60 * 60 * 1_000,
+          recentActivityGraceMs: 60 * 60 * 1_000,
+          dryRun: true,
+        }),
+        new Set(),
+      );
+
+      expect(result.scanned).toBe(2);
+      expect(result.archivedScanned).toBe(1);
+      expect(result.deletions).toEqual([
+        { id: "archived-root", title: "archived-root", dryRun: true, archived: true },
+        { id: "normal-root", title: "normal-root", dryRun: true },
+      ]);
+      expect(formatSweepSummary(result)).toContain("archived scanned: 1");
+      expect(formatSweepSummary(result)).toContain("[DRY-RUN] [archived] archived-root");
     });
   });
 });

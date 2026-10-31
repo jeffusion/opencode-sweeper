@@ -349,11 +349,11 @@ test("V2 keeps the verified client for list, active, and remove", async () => {
   const session = { id: "old", title: "old", time: { created: old, updated: old } };
   const calls: string[] = [];
   const argvClient = {
-    server: { info: async () => ({ pid: 4242 }) },
+    server: { info: async () => ({ pid: 4242, version: "2.1.3" }) },
     session: {
-      list: async () => {
+      list: async (input?: { archived?: boolean }) => {
         calls.push("argv.list");
-        return { data: [session], cursor: {} };
+        return { data: input?.archived === true ? [] : [session], cursor: {} };
       },
       active: async () => {
         calls.push("argv.active");
@@ -400,7 +400,10 @@ test("V2 keeps the verified client for list, active, and remove", async () => {
   );
 
   expect(result.deleted).toBe(1);
-  expect(calls).toEqual(["argv.list", "argv.active", "argv.list", "argv.active", "argv.remove"]);
+  expect(calls.filter((call) => call === "argv.list")).toHaveLength(4);
+  expect(calls.filter((call) => call === "argv.active")).toHaveLength(2);
+  expect(calls.filter((call) => call === "argv.remove")).toEqual(["argv.remove"]);
+  expect(calls.every((call) => call.startsWith("argv."))).toBe(true);
   expect(make).toHaveBeenCalledTimes(1);
   expect(discover).not.toHaveBeenCalled();
 });

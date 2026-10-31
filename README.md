@@ -1,14 +1,20 @@
 # opencode-sweeper
 
-An [opencode](https://opencode.ai) plugin that cleans up **expired sessions and their cascaded subagents** on a configurable schedule, plus a `/sweep` slash command for manual cleanup.
+An [opencode](https://opencode.ai) plugin that cleans up **expired sessions and their cascaded subagents** on a configurable schedule, plus a `/sweep` slash command for manual cleanup. The same package also provides `opencode-sweeper codex`, a separate preview-first cleanup command for Codex CLI sessions.
 
 ## Compatibility
 
-The V1 entrypoint has been checked against **OpenCode 1.17.0 and 1.17.13** source, and the V2 API and loader against **OpenCode 2.0.15**. V2 integration has also been exercised on **OpenCode 2.1.3**: current-process binding and real-session cleanup on a private `serve` host, plus serialized multi-location timer cleanup on a native `serve --service` host using an isolated backup of real session data. Other releases and V1 live-host integration remain unverified.
+OpenCode V2 cleanup currently supports **host 2.1.3**. The V1 implementation remains available but has not been real-host tested for this change.
+
+Archive coverage in V2 is gated to host **2.1.3**, the targeted baseline for the archived-list contract. Older, newer, or unidentifiable hosts are diagnose-only: the plugin loads normally but performs **zero deletions**, including ordinary sessions. Hosts inside the gate also sweep archived sessions, so previously invisible archived sessions can be deleted. This is a breaking compatibility change.
+
+V1 reads `time_archived` from SQLite and reports archived sessions. In both modes, an archived session expires by `time.updated`; the archive timestamp is not a separate retention deadline and does not reset the clock.
+
+The plugin pins `@opencode/client` **2.1.3** so the typed `archived` list parameter is available. Installing this package does not upgrade the OpenCode host, and the client version alone does not prove host support; the host-version gate above remains authoritative.
 
 | Feature | V1 Mode | V2 Mode |
 |---|---|---|
-| **Session listing** | Direct SQLite read (bypasses SDK project filter & 100-row limit) | `OpenCode` SDK's `session.list()` + `session.active()` |
+| **Session listing** | Direct SQLite read (bypasses SDK project filter & 100-row limit) | `OpenCode` SDK's `session.list()` + `session.active()`; normal and archived lists are paginated separately |
 | **Cross-project pagination** | ✅ Direct DB read covers all projects | ✅ Paginating `session.list()` enumerates all sessions |
 | **Process verification** | ❌ Not applicable | ✅ Current `serve` listener or discovered shared service, always verified against the plugin PID |
 | **Active session protection** | Timer: no session context; Manual `/sweep`: auto-protected | Timer: auto-protected via `session.active()`; Manual: auto-protected |
@@ -129,6 +135,8 @@ For a local V2 plugin directory, first run `bun run build` in the plugin reposit
 
 Unknown options are rejected — typos fail loud, not silent.
 
+Archived sessions use the same `expiry`, `subagentExpiry`, `recentActivityGrace`, and `protect` rules as ordinary sessions. Archiving does not reset `time.updated` and does not create a separate deadline. The summary reports `archived scanned`, and archived entries in the deletion list carry `[archived]`.
+
 > **Note**: V2 mode uses `@opencode/client` v2.x SDK APIs (`OpenCode`, `Service`) which provide structured session metadata and automatic cross-project enumeration via pagination.
 
 ## Usage
@@ -142,6 +150,7 @@ Example output (rendered via the model):
 ```
 Sweep complete.
 scanned: 14
+archived scanned: 2
 deleted: 6
 protected: 1
 recentActive skipped: 4
@@ -153,6 +162,7 @@ errors: 0
 deletions:
   [DELETED] ses_abc — "Build refactor spike"
   [DELETED] ses_def — "Reproduce auth bug"
+  [DELETED] [archived] ses_ghi — "Old archived thread"
   [DELETED] ses_xyz — "" (parent: ses_abc)
 ```
 
@@ -161,6 +171,20 @@ deletions:
 On plugin load with `interval > 0`, a `setInterval(sweep, intervalMs)` starts. The timer is cleared on `dispose`. In V1, each tick logs via `app.log` with `service: opencode-sweeper`; in V2, timer results/errors are logged with `console.info`/`console.error`.
 
 Disable the timer: `"interval": 0`.
+
+## Codex CLI cleanup
+
+Requires **Codex CLI 0.163.0**. This standalone command cleans ordinary and archived sessions under `CODEX_HOME` (default `~/.codex`), independently of OpenCode:
+
+```bash
+# Preview only; nothing is deleted.
+opencode-sweeper codex
+
+# Permanently delete eligible sessions after reviewing the preview.
+opencode-sweeper codex --apply
+```
+
+Defaults: `30d` for main sessions, `7d` for subagents, and `1h` recent-activity grace. Use `--protect <id>` to retain a session. See [Codex options and safety limits](https://github.com/jeffusion/opencode-sweeper/blob/main/docs/codex.md) before enabling deletion.
 
 ## How it works
 
@@ -196,10 +220,16 @@ If `dbPath` is not set in the plugin options, the path auto-resolves via `XDG_DA
 
 V2 mode activates automatically when the plugin detects it's running in an OpenCode V2 host (via the `setup` function's dynamic import of `./v2.js`). The key differences:
 
-1. **Session listing via SDK API**: Uses the complete `OpenCode.make()` client, including `session.active()`. The current process's explicit `serve --hostname/--port` listener is tried first, with authentication from `OPENCODE_SERVER_USERNAME` (default `opencode`) and `OPENCODE_SERVER_PASSWORD`. Shared-service discovery is a second candidate source. All sessions are enumerated via `session.list()` with pagination (`listAll` function) — no direct SQLite access required.
+1. **Session listing via SDK API**: Uses the complete `OpenCode.make()` client, including `session.active()`. The current process's explicit `serve --hostname/--port` listener is tried first, with authentication from `OPENCODE_SERVER_USERNAME` (default `opencode`) and `OPENCODE_SERVER_PASSWORD`. Shared-service discovery is a second candidate source. All sessions are enumerated via `session.list()` with pagination (`listAll` function) — no direct SQLite access required. `listAll` requests the normal and archived lists separately with the SDK's boolean `archived` filter, fully paginates both, and merges them.
 2. **Process verification**: Every candidate must pass `client.server.info().pid === process.pid` before any session scan or deletion. A different global service is never accepted merely because the current listener is unavailable. Once verified, one client is used for the entire sweep; failures do not switch the running sweep to another server. No port scanning, guessed default port, or OpenChamber-specific path is used. An unknown listener, dynamic port `0`, or unavailable authentication cannot be assumed safe; if no candidate can be verified, the sweep fails closed.
 3. **Active session protection**: The timer sweep calls `client.session.active()` to get all currently active session IDs and protects them automatically via `protectedNow = new Set([...protectedIDs, ...active])`.
 4. **Delete operation**: Uses `client.session.remove({ sessionID: id })` instead of `session.delete()`.
+
+#### V2 archive enumeration gate
+
+Before scanning, V2 reads the **host** version from `server.info().version`; the `@opencode/client` package version is not a substitute. Only host **2.1.3** is accepted. Older, newer, and unknown hosts are fail-closed: the plugin remains loaded, reports that the host version is unsupported, and deletes nothing — it does not fall back to a normal-only sweep or treat archived sessions as empty.
+
+An initial scan that cannot fully enumerate both lists (request or page failure, the same ID in both groups, or `time.archived` inconsistent with its group) deletes zero sessions. If a pre-delete refresh hits the same class of conflict, the run stops further deletions and keeps already-confirmed results. The two lists are not an atomic snapshot; sessions can migrate between them after they are read.
 
 #### V2 Pre-delete Checks and Concurrency Limits
 
@@ -255,6 +285,12 @@ Same as Warning B — V1's SQLite-based approach has the same per-process timer 
 ### Warning E: V2 Process mismatch (fail-closed)
 
 Every V2 endpoint candidate is checked using `client.server.info().pid === process.pid`. A candidate with a mismatching PID is rejected. If none can be verified, the plugin **refuses to scan or delete sessions and reports an error**. This can occur when only another process's shared-service registration is available, or when the current host's listener/authentication cannot be determined. Do not remove the PID check to make cleanup run. A matching PID does not make independent hosts sharing one database safe; see [V2 Pre-delete Checks and Concurrency Limits](#v2-pre-delete-checks-and-concurrency-limits).
+
+### Warning F: V2 archive coverage is host-gated (BREAKING)
+
+Accepting archived sessions changes what a timer deletes: on an accepted host, archived sessions older than the normal thresholds are now candidates too. Conversely, a host outside the accepted version set deletes **nothing**, including ordinary sessions, instead of performing a normal-only sweep. Both outcomes follow from the same gate. If you need cleanup on another host version, wait until that version is verified rather than bypassing the gate; the plugin intentionally has no override.
+
+Archiving is not a deletion signal and not a separate deadline. A session archived moments ago is still protected by `time.updated` and `recentActivityGrace`.
 
 ## Surfaces
 

@@ -3,6 +3,8 @@ export type SessionLike = {
   parentID?: string;
   title: string;
   directory: string;
+  /** Present as `true` when the session is archived; archived sessions expire by `time.updated` like any other. */
+  archived?: boolean;
   time: {
     created: number;
     updated: number;
@@ -19,6 +21,7 @@ export interface SweeperClient {
 
 export type SweepResult = {
   scanned: number;
+  archivedScanned: number;
   deleted: number;
   protectedCount: number;
   recentActiveSkipped: number;
@@ -27,10 +30,24 @@ export type SweepResult = {
   cascadeBlockedSkipped: number;
   dryRunSkipped: number;
   errors: Array<{ id: string; error: string }>;
-  deletions: Array<{ id: string; title: string; parentID?: string; dryRun: boolean }>;
+  deletions: Array<{
+    id: string;
+    title: string;
+    parentID?: string;
+    dryRun: boolean;
+    archived?: true;
+  }>;
 };
 
 type DeletionRecord = SweepResult["deletions"][number];
+
+/** A caller-side revalidation failure: stop later deletes but keep results already confirmed. */
+export class SweepAbortError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SweepAbortError";
+  }
+}
 
 function sessionDeletionRecord(session: SessionLike, dryRun: boolean): DeletionRecord {
   const deletion: DeletionRecord = {
@@ -41,6 +58,9 @@ function sessionDeletionRecord(session: SessionLike, dryRun: boolean): DeletionR
 
   if (session.parentID !== undefined) {
     deletion.parentID = session.parentID;
+  }
+  if (session.archived === true) {
+    deletion.archived = true;
   }
 
   return deletion;
@@ -69,6 +89,7 @@ export async function runSweep(
 
   const result: SweepResult = {
     scanned: 0,
+    archivedScanned: 0,
     deleted: 0,
     protectedCount: 0,
     recentActiveSkipped: 0,
@@ -100,6 +121,9 @@ export async function runSweep(
   // descendants, so an ancestor is unsafe whenever any descendant is unsafe.
   for (const session of sessions) {
     result.scanned += 1;
+    if (session.archived === true) {
+      result.archivedScanned += 1;
+    }
 
     if (protectedSessionIDs.has(session.id)) {
       result.protectedCount += 1;
@@ -266,6 +290,7 @@ export async function runSweep(
       }
     } catch (error: unknown) {
       result.errors.push({ id: session.id, error: errorMessage(error) });
+      if (error instanceof SweepAbortError) break;
     }
   }
 

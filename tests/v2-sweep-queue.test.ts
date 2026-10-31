@@ -303,8 +303,8 @@ function stateClient(
   listScans: number[],
   onRemove?: (id: string) => Promise<void>,
 ) {
-  const list = mock(async () => {
-    const data = [...state.values()];
+  const list = mock(async (input?: { archived?: boolean }) => {
+    const data = input?.archived === true ? [] : [...state.values()];
     listScans.push(data.length);
     return { data, cursor: {} };
   });
@@ -315,7 +315,17 @@ function stateClient(
     return true;
   });
   return {
-    client: asClient({ session: { list, active, remove } }),
+    client: asClient({
+      server: {
+        info: mock(async () => ({
+          version: "2.1.3",
+          pid: 1,
+          urls: [],
+          paths: { tmp: "/tmp" },
+        })),
+      },
+      session: { list, active, remove },
+    }),
     list,
     active,
     remove,
@@ -364,7 +374,7 @@ test("two setupV2 locations use separate opts/protect and rescan after A", async
       .getTool()
       .execute({}, { sessionID: "caller-a", signal: new AbortController().signal });
     await aRemoveStarted.promise;
-    expect(aScans).toEqual([4, 4]);
+    expect(aScans).toEqual([4, 0, 4, 0]);
     expect(state.size).toBe(4);
 
     const bRun = b
@@ -382,8 +392,8 @@ test("two setupV2 locations use separate opts/protect and rescan after A", async
     expect(aFactory).toHaveBeenCalledTimes(1);
     expect(bFactory).toHaveBeenCalledTimes(1);
     expect(removeCalls).toEqual([`a:${ids.days100}`, `b:${ids.days25}`]);
-    expect(aScans).toEqual([4, 4]);
-    expect(bScans).toEqual([3, 3]);
+    expect(aScans).toEqual([4, 0, 4, 0]);
+    expect(bScans).toEqual([3, 0, 3, 0]);
     expect([...state.keys()].sort()).toEqual([ids.days35, ids.days10].sort());
 
     expect(summaryCount(aResult.content, "scanned")).toBe(4);

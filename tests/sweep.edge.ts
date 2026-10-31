@@ -102,6 +102,7 @@ describe("runSweep edge cases", () => {
 
       expect(result).toEqual({
         scanned: 0,
+        archivedScanned: 0,
         deleted: 0,
         protectedCount: 0,
         recentActiveSkipped: 0,
