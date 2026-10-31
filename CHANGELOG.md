@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.2](https://github.com/jeffusion/opencode-sweeper/compare/v0.3.1...v0.3.2) (2026-10-31)
+
+
+### Bug Fixes
+
+* **db:** 修正 V1 数据库默认路径及缺失诊断 ([#11](https://github.com/jeffusion/opencode-sweeper/issues/11)) ([f3510ff](https://github.com/jeffusion/opencode-sweeper/commit/f3510ff7e573e98180f825be27dd1279aabfae04))
+
 ## [0.3.1](https://github.com/jeffusion/opencode-sweeper/compare/v0.3.0...v0.3.1) (2026-10-23)
 
 
