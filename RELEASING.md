@@ -58,7 +58,7 @@ npm 上已存在 `opencode-sweeper` 包，因此**必须先**在 npm 包页面�
 
 `publish` job 在 Release tag（`needs.release-please.outputs.tag_name`）上执行：
 
-- `oven-sh/setup-bun@v2` 安装 Bun 1.4.2，`bun install --frozen-lockfile`。
+- `oven-sh/setup-bun@v2` 从 `.bun-version` 读取 Bun 版本（当前为 1.4.2），与 CI 和本地开发保持一致；执行 `bun install --frozen-lockfile`。
 - 依次运行 typecheck、lint、test；默认 `bun test` 之后**额外执行 `bun test ./tests/sweep.cascade.ts`**（默认测试会漏掉 cascade 用例）。
 - 构建前记录 `package.json`、`.release-please-manifest.json`、`bun.lock` 的 sha256，构建后校验一致性，确保 build 不修改发布元数据。
 - 校验 Node ≥ 24 与 npm ≥ 11.5.1。
