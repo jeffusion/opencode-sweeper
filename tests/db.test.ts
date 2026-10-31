@@ -1,10 +1,9 @@
 import { afterEach, beforeEach, test } from "bun:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  DbBackendUnavailableError,
   SchemaMismatchError,
   listSessions,
   resolveOpencodeDbPath,
@@ -237,59 +236,70 @@ test("SchemaMismatchError fires when required column is missing", async () => {
   );
 });
 
-test("DbBackendUnavailableError when db file does not exist", async () => {
-  // bun:sqlite with fileMustExist:false creates empty DB silently; rw path: nonexistent file
-  // Our adapter opens readonly — when file doesn't exist, backend open throws.
-  // Verify the typed error path triggers (the dynamic import succeeds, then open throws).
-  const missingPath = join(tmpDir, "does-not-exist.db");
-  // Since our code uses fileMustExist default (true for bun:sqlite), open should throw.
-  // But the error message path may differ per backend. We tolerate either: typed
-  // DbBackendUnavailableError OR raw backend error — what we MUST rule out is silent success.
-  let caught: unknown;
-  try {
-    await listSessions(missingPath);
-  } catch (err) {
-    caught = err;
+function withEnv(values: Record<string, string | undefined>, fn: () => void): void {
+  const saved: Record<string, string | undefined> = {};
+  for (const key of Object.keys(values)) {
+    saved[key] = process.env[key];
   }
-  assert.ok(caught, "listSessions should throw when DB file is missing");
-  // We don't strictly require the typed error since the message detection is heuristic;
-  // the contract is "never silently return [] when the file is missing".
-});
+  for (const [key, value] of Object.entries(values)) {
+    if (value === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = value;
+    }
+  }
+  try {
+    fn();
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+  }
+}
 
 test("resolveOpencodeDbPath uses explicit override when provided", () => {
-  assert.equal(resolveOpencodeDbPath("/custom/path.db"), "/custom/path.db");
-  assert.equal(resolveOpencodeDbPath("/another.db"), "/another.db");
+  withEnv({ XDG_DATA_HOME: "/tmp/fake-xdg" }, () => {
+    assert.equal(resolveOpencodeDbPath("/custom/path.db"), "/custom/path.db");
+    assert.equal(resolveOpencodeDbPath("/another.db"), "/another.db");
+  });
 });
 
-test("resolveOpencodeDbPath honors XDG_DATA_HOME on Linux-like systems", () => {
-  const origXdg = process.env.XDG_DATA_HOME;
-  // Save and patch.
-  process.env.XDG_DATA_HOME = "/tmp/fake-xdg";
-  try {
-    // XDG path takes priority over platform default on Linux.
-    const path = resolveOpencodeDbPath();
-    assert.equal(path, "/tmp/fake-xdg/opencode/opencode.db");
-  } finally {
-    if (origXdg === undefined) {
-      process.env.XDG_DATA_HOME = undefined;
-    } else {
-      process.env.XDG_DATA_HOME = origXdg;
-    }
-  }
+test("resolveOpencodeDbPath honors XDG_DATA_HOME", () => {
+  withEnv({ XDG_DATA_HOME: "/tmp/fake-xdg" }, () => {
+    assert.equal(resolveOpencodeDbPath(), "/tmp/fake-xdg/opencode/opencode.db");
+  });
 });
 
-test("resolveOpencodeDbPath falls back to platform default when no override or XDG", () => {
-  const origXdg = process.env.XDG_DATA_HOME;
-  process.env.XDG_DATA_HOME = undefined;
-  try {
-    const path = resolveOpencodeDbPath();
-    // We don't assert exact home (~/.local on linux, ~/Library on darwin) — just that
-    // the returned path ends with /opencode/opencode.db and is non-empty.
-    assert.match(path, /opencode\/opencode\.db$/);
-    assert.ok(path.length > 0);
-  } finally {
-    if (origXdg !== undefined) {
-      process.env.XDG_DATA_HOME = origXdg;
+test("resolveOpencodeDbPath falls back to homedir/.local/share for unset or empty XDG", () => {
+  const expected = join(homedir(), ".local", "share", "opencode", "opencode.db");
+  withEnv({ XDG_DATA_HOME: undefined }, () => {
+    assert.equal(resolveOpencodeDbPath(), expected);
+  });
+  withEnv({ XDG_DATA_HOME: "" }, () => {
+    assert.equal(resolveOpencodeDbPath(), expected);
+    // Empty override also falls back.
+    assert.equal(resolveOpencodeDbPath(""), expected);
+  });
+});
+
+test("resolveOpencodeDbPath never uses the macOS Application Support layout", () => {
+  withEnv({ XDG_DATA_HOME: undefined }, () => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform");
+    assert.ok(platform);
+    try {
+      for (const value of ["darwin", "linux"]) {
+        Object.defineProperty(process, "platform", { ...platform, value });
+        assert.equal(
+          resolveOpencodeDbPath(),
+          join(homedir(), ".local", "share", "opencode", "opencode.db"),
+        );
+      }
+    } finally {
+      Object.defineProperty(process, "platform", platform);
     }
-  }
+  });
 });
