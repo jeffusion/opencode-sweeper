@@ -269,6 +269,8 @@ Every V2 endpoint candidate is checked using `client.server.info().pid === proce
 
 ## Development
 
+本地开发和测试需要 Bun >= 1.4.2；推荐使用 `.bun-version` 指定的版本，与 CI 和发布保持一致。Bun 1.3.x 的 `ResolveMessage` 不继承 `Error`，会导致 V2 插件入口解析测试失败；无需为此修改插件入口或升级 OpenCode 依赖。
+
 ```bash
 bun install
 bun test
