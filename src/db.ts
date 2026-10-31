@@ -21,6 +21,9 @@
  * opencode's writes. We never write, never ATTACH, never run pragmas that mutate.
  */
 
+import { stat } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type { SessionLike } from "./sweep.js";
 
 /** Raw row shape we select from the `session` table. */
@@ -161,28 +164,38 @@ export class DbBackendUnavailableError extends Error {
   }
 }
 
+/** The DB file is absent — distinct from present-but-unreadable. */
+export class OpencodeDbNotFoundError extends Error {
+  readonly dbPath: string;
+  constructor(dbPath: string, cause?: unknown) {
+    super(
+      `opencode database not found at ${dbPath}. Start OpenCode at least once to create it, check XDG_DATA_HOME if it is set, or configure the plugin's dbPath option.`,
+      { cause },
+    );
+    this.name = "OpencodeDbNotFoundError";
+    this.dbPath = dbPath;
+  }
+}
+
 /**
  * Resolve the opencode SQLite database path. opencode 1.x stores the DB at
- * `<XDG_DATA_HOME>/opencode/opencode.db` (Linux `~/.local/share/opencode/opencode.db`,
- * macOS `~/Library/Application Support/opencode/opencode.db`). The plugin does not
- * guess the path — it resolves via `XDG_DATA_HOME` env or platform default.
+ * `<XDG_DATA_HOME>/opencode/opencode.db`, falling back to
+ * `~/.local/share/opencode/opencode.db` when `XDG_DATA_HOME` is unset/empty.
+ * Same layout on every platform — opencode does not use macOS's
+ * `Application Support` directory.
  */
 export function resolveOpencodeDbPath(override?: string): string {
   if (override !== undefined && override.length > 0) {
     return override;
   }
-  const home = process.env.HOME ?? process.env.USERPROFILE ?? "";
-  const xdgData = process.env.XDG_DATA_HOME ?? "";
-  // Linux: $XDG_DATA_HOME/opencode/opencode.db or ~/.local/share/opencode/opencode.db
-  // macOS: ~/Library/Application Support/opencode/opencode.db
-  // We check XDG first (opencode honors it on Linux), then platform defaults.
-  if (xdgData.length > 0) {
-    return `${xdgData}/opencode/opencode.db`;
-  }
-  if (process.platform === "darwin") {
-    return `${home}/Library/Application Support/opencode/opencode.db`;
-  }
-  return `${home}/.local/share/opencode/opencode.db`;
+  const dataHome = process.env.XDG_DATA_HOME || join(homedir(), ".local", "share");
+  return join(dataHome, "opencode", "opencode.db");
+}
+
+function isEnoent(error: unknown): boolean {
+  return (
+    typeof error === "object" && error !== null && (error as { code?: unknown }).code === "ENOENT"
+  );
 }
 
 /**
@@ -193,6 +206,8 @@ export function resolveOpencodeDbPath(override?: string): string {
  * Throws `SchemaMismatchError` if opencode future schema drops required columns.
  * Throws `DbBackendUnavailableError` if neither `bun:sqlite` nor `node:sqlite`
  * is importable (extremely unlikely for opencode plugin hosts).
+ * Throws `OpencodeDbNotFoundError` only when `stat` confirms ENOENT; other open
+ * failures (permissions, directory path, corrupt file) keep their own cause.
  */
 export async function listSessions(dbPath: string): Promise<SessionRow[]> {
   let db: ReadOnlyDatabase;
@@ -208,7 +223,25 @@ export async function listSessions(dbPath: string): Promise<SessionRow[]> {
     ) {
       throw new DbBackendUnavailableError(`No SQLite backend available: ${msg}`);
     }
-    throw error;
+    // SQLite reports every open failure as "unable to open database file", so
+    // ask the filesystem whether the file is actually absent. Only ENOENT maps
+    // to "not found"; a stat failure (e.g. EACCES) must not swallow the reason.
+    let statFailure: unknown;
+    try {
+      await stat(dbPath);
+    } catch (statError) {
+      if (isEnoent(statError)) {
+        throw new OpencodeDbNotFoundError(dbPath, error);
+      }
+      statFailure = statError;
+    }
+    const statDetail =
+      statFailure === undefined
+        ? ""
+        : ` (stat failed: ${statFailure instanceof Error ? statFailure.message : String(statFailure)})`;
+    throw new Error(`Failed to open opencode database at ${dbPath}: ${msg}${statDetail}`, {
+      cause: error,
+    });
   }
 
   try {
