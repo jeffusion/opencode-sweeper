@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.3](https://github.com/jeffusion/opencode-sweeper/compare/v0.3.2...v0.3.3) (2026-10-31)
+
+
+### Bug Fixes
+
+* **dev:** align Bun runtime with CI ([13cce06](https://github.com/jeffusion/opencode-sweeper/commit/13cce066ebad137085f7f472eefad49c9417eac9))
+
 ## [0.3.2](https://github.com/jeffusion/opencode-sweeper/compare/v0.3.1...v0.3.2) (2026-10-31)
 
 
